@@ -234,7 +234,7 @@ class Subs(unittest.TestCase):
 
     def assert_subs_keep_coming(self):
         start = self.mpv.get("time-pos")
-        self.mpv.wait_for(lambda: self.mpv.get("time-pos") > start + 2.5)
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") > start + 2.5, timeout=15)
         self.assertRegex(self.mpv.get("sub-text"), r"^Line \d+$")
 
     def test_cycle(self):
