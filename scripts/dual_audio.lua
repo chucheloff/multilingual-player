@@ -20,6 +20,10 @@
 -- (SIDE 1 = left ear / first pair, 2 = the other; gain in dB, delay in ms).
 -- The state is published in user-data/dual_audio for the menu.
 --
+-- Subtitles can follow the sides (follow_subs, or the follow-subs binding,
+-- which has no key of its own): the first side's language as the main
+-- subtitles, the other side's as mpv's secondary ones (at the top).
+--
 -- Options below are set in script-opts/dual_audio.conf or with
 -- --script-opts=dual_audio-KEY=VALUE.
 
@@ -33,11 +37,13 @@ local opts = {
     right_lang = "",    -- preferred languages for the right ear / second pair, e.g. "rus,ru"
     pair_names = "",    -- "first|second": device names shown on the OSD in pairs mode
     balance_step = 2,   -- dB per balance keypress
+    follow_subs = false, -- subtitles in both sides' languages (see update_subs)
 }
 options.read_options(opts, "dual_audio")
 local pairs_mode = opts.mode == "pairs"
 
 local side_names = pairs_mode and { "Pair 1", "Pair 2" } or { "Left ear", "Right ear" }
+local sides_word = pairs_mode and "pairs" or "ears"
 local devices = {}      -- pairs mode: each pair's device, from pair_names
 for name in opts.pair_names:gmatch("[^|]+") do devices[#devices + 1] = name end
 
@@ -50,14 +56,20 @@ local ours = false      -- lavfi-complex currently holds our graph
 -- Languages to look for in the next file; follows manual track changes so a
 -- playlist of episodes keeps the same assignment.
 local pref = { left = opts.left_lang, right = opts.right_lang }
+local follow = opts.follow_subs
+local sub_props = { "sid", "secondary-sid" }  -- the first side's subtitles, then the other's
+local subs_set          -- the subtitle ids we selected while following, by slot; nil otherwise
+local loading = true    -- a file is loading: mpv picks its own subtitles until on_preloaded
 
-local function audio_tracks()
+local function tracks_of(kind)
     local list = {}
     for _, t in ipairs(mp.get_property_native("track-list", {})) do
-        if t.type == "audio" then list[#list + 1] = t end
+        if t.type == kind then list[#list + 1] = t end
     end
     return list
 end
+
+local function audio_tracks() return tracks_of("audio") end
 
 local function by_id(tracks, id)
     for _, t in ipairs(tracks) do
@@ -170,6 +182,7 @@ local function publish()
     end
     mp.set_property_native("user-data/dual_audio", {
         enabled = enabled, active = ours, mode = opts.mode, tracks = list, sides = sides,
+        follow_subs = follow,
     })
 end
 
@@ -177,11 +190,55 @@ end
 -- subtitle streams while sid still names them, so subtitles vanish once the
 -- packets already read run out. Selecting them again brings them back.
 local function reselect_subs()
-    for _, prop in ipairs({ "sid", "secondary-sid" }) do
+    for _, prop in ipairs(sub_props) do
         local id = mp.get_property_number(prop)
         if id then
             mp.set_property(prop, "no")
             mp.set_property_number(prop, id)
+        end
+    end
+end
+
+-- The subtitle track in the language of audio track `id`: a full one before
+-- a forced one (that only covers what is said in another language).
+local function sub_for(id)
+    local lang = by_id(audio_tracks(), id).lang
+    local full, forced = {}, {}
+    for _, t in ipairs(tracks_of("sub")) do table.insert(t.forced and forced or full, t) end
+    return lang and (by_lang(full, lang) or by_lang(forced, lang))
+end
+
+-- While following, each side's language gets its subtitle slot: empty if
+-- there are none in it, and one line is enough when both sides hear the same
+-- language. Selecting them anew also brings them back after a graph change
+-- (see reselect_subs). Otherwise the second line goes if it was ours, and the
+-- main one stays: the first side's language is what plays with dual audio off.
+local function update_subs(live)
+    if not (follow and ours) then
+        if subs_set then mp.set_property("secondary-sid", "no") end
+        subs_set = nil
+        if live then reselect_subs() end
+        return
+    end
+    subs_set = { sub_for(left), sub_for(right) }
+    if subs_set[2] == subs_set[1] then subs_set[2] = nil end
+    -- Clear both first: a track selected in one slot can't be selected in the
+    -- other, and after a swap they trade places.
+    for _, prop in ipairs(sub_props) do mp.set_property(prop, "no") end
+    for i, prop in ipairs(sub_props) do
+        if subs_set[i] then mp.set_property_number(prop, subs_set[i]) end
+    end
+end
+
+-- A subtitle change we didn't make is the user's own pick: stop following
+-- instead of fighting it. While a file loads, the changes are mpv's.
+local function subs_changed()
+    if loading or not subs_set then return end
+    for i, prop in ipairs(sub_props) do
+        if mp.get_property_number(prop) ~= subs_set[i] then
+            follow, subs_set = false, nil
+            msg.info("Subtitles picked by hand: they no longer follow the " .. sides_word)
+            return publish()
         end
     end
 end
@@ -207,7 +264,7 @@ local function apply(live)
     end
     -- Back to normal playback: keep the left-ear / first-pair language.
     if not want and left then mp.set_property_number("aid", left) end
-    if live then reselect_subs() end
+    update_subs(live)
     if pos then
         mp.commandv("drop-buffers")
         mp.commandv("seek", pos, "absolute+exact")
@@ -281,6 +338,14 @@ local function nudge(side)
     show()
 end
 
+-- Only the subtitles change, so the graph stays as it is.
+local function toggle_follow()
+    follow = not follow
+    update_subs(false)
+    publish()
+    mp.osd_message(string.format("Subtitles follow the %s: %s", sides_word, follow and "on" or "off"), 3)
+end
+
 -- set-track / set-gain / set-delay SIDE VALUE, from the bubbaTV menu.
 local setters = {
     ["set-track"] = function(i, id)
@@ -302,9 +367,13 @@ for name, set in pairs(setters) do
     end)
 end
 
+mp.register_event("start-file", function() loading = true end)
+
+-- Before mpv selects the tracks: it takes the subtitles set here too.
 mp.add_hook("on_preloaded", 50, function()
     left, right = nil, nil
     apply(false)
+    loading = false
 end)
 
 mp.register_event("file-loaded", function()
@@ -314,6 +383,7 @@ end)
 -- Tracks come and go (next file, --audio-file), and so does the output.
 mp.observe_property("track-list", nil, publish)
 mp.observe_property("audio-device", nil, publish)
+for _, prop in ipairs(sub_props) do mp.observe_property(prop, "number", subs_changed) end
 
 -- Pairs mode on an ordinary stereo device folds channels 3-4 into 1-2, so
 -- everyone hears both languages. Say so instead of leaving it a mystery.
@@ -334,3 +404,4 @@ mp.add_key_binding("}", "cycle-right", function() cycle("right") end)
 mp.add_key_binding("y", "swap", swap)
 mp.add_key_binding("h", "balance-left", function() nudge(1) end)
 mp.add_key_binding("k", "balance-right", function() nudge(2) end)
+mp.add_key_binding(nil, "follow-subs", toggle_follow)
