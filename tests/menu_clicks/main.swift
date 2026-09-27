@@ -51,6 +51,12 @@ func get(_ name: String) -> String {
 
 func graph() -> String { get("lavfi-complex") }
 
+/// Each side's state as dual_audio.lua publishes it.
+func sides() -> [[String: Any]] {
+    let o = try? JSONSerialization.jsonObject(with: Data(get("user-data/dual_audio").utf8)) as? [String: Any]
+    return o?["sides"] as? [[String: Any]] ?? []
+}
+
 func ui<T>(_ body: @MainActor () -> T) -> T {
     DispatchQueue.main.sync { MainActor.assumeIsolated(body) }
 }
@@ -91,6 +97,18 @@ func devices() {
     wait("audio output back again") { get("current-ao") == "null" }
 }
 
+func check(_ what: String, _ ok: Bool) {
+    guard ok else {
+        print("FAIL \(what)")
+        exit(1)
+    }
+    print("ok \(what)")
+}
+
+@MainActor func plus(_ row: SliderRow) -> NSButton {
+    row.subviews.compactMap { $0 as? NSButton }.first { $0.title == "+" }!
+}
+
 Thread {
     wait("menu installed before Window") { ui { bar.items.map(\.title) } == ["bubbaTV", "Window"] }
     if pairs {
@@ -105,12 +123,23 @@ Thread {
     ui { click(trackMenus()[1].submenu!, "[2] Russian 1000Hz 5.1 (rus)") }
     wait("same track for both from the submenu") { graph().hasPrefix("[aid2]asplit=2") }
     wait("menu shows it") { ui { trackMenus().last?.title } == "Audio track: [2] Russian 1000Hz 5.1 (rus)" }
+    // A slider sends each step as it happens, not after a pause.
+    let sent = ui { () -> [Double] in
+        var sent: [Double] = []
+        let row = SliderRow("Loudness", -30...6, step: 1, unit: "dB", value: 0) { sent.append($0) }
+        plus(row).performClick(nil)
+        plus(row).performClick(nil)
+        return sent
+    }
+    check("slider sends each step at once", sent == [1, 2])
+    let before = graph()
     ui {
         // Slider rows: left loudness, left delay, right loudness, right delay.
         let rows = menu().items.compactMap { $0.view as? SliderRow }
-        rows[2].subviews.compactMap { $0 as? NSButton }.first { $0.title == "+" }!.performClick(nil)
+        plus(rows[2]).performClick(nil)
     }
-    wait("right loudness + after the pause") { graph().contains("volume=1dB[r]") }
+    wait("right loudness +") { sides().last?["gain"] as? Double == 1 }
+    check("live: the graph stays", graph() == before)
     ui { click(menu(), "Subtitles follow ears") }
     wait("subtitles follow the ears") {
         get("user-data/dual_audio").contains("\"follow_subs\":true")
