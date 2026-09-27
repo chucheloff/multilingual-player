@@ -133,9 +133,10 @@ class Render(unittest.TestCase):
                                      "--audio-channels=quad"), [440, 440, 1000, 1000])
 
     def test_pairs_mode_names_and_stereo_warning(self):
+        # Played in real time: an untimed render is over within milliseconds,
+        # sometimes before the script has seen the output's channel count.
         out = subprocess.run(
-            BASE[:-1] + ["--no-video", "--ao=pcm", "--ao-pcm-file=" + os.path.join(self.tmp.name, "o.wav"),
-                         "--untimed", "--end=1", "--audio-channels=stereo",
+            BASE[:-1] + ["--no-video", "--ao=null", "--end=1", "--audio-channels=stereo",
                          "--msg-level=all=no,dual_audio=info",
                          "--script-opts-append=dual_audio-auto=yes",
                          "--script-opts-append=dual_audio-mode=pairs",
