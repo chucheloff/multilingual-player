@@ -11,7 +11,7 @@
 --
 -- Keys (rebind in input.conf with `KEY script-binding dual_audio/<name>`):
 --   a  toggle          y  swap
---   [  cycle-left      ]  cycle-right   (replace mpv's speed -/+10% keys)
+--   {  cycle-left      }  cycle-right   (Shift+[ / Shift+]; replace mpv's speed halve/double)
 --   h  balance-left    k  balance-right
 --
 -- Options below are set in script-opts/dual_audio.conf or with
@@ -134,6 +134,21 @@ local function graph()
         .. "[l][r]join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR[ao]"
 end
 
+-- Changing lavfi-complex during playback makes mpv stop reading the
+-- subtitle streams while sid still names them, so subtitles vanish once the
+-- packets already read run out. Select them again once playback restarts
+-- after apply()'s seek - done right away, it races that seek.
+local function reselect_subs()
+    mp.unregister_event(reselect_subs)
+    for _, prop in ipairs({ "sid", "secondary-sid" }) do
+        local id = mp.get_property_number(prop)
+        if id then
+            mp.set_property(prop, "no")
+            mp.set_property_number(prop, id)
+        end
+    end
+end
+
 -- Installs or removes the graph. `live` means playback is under way: mpv's
 -- refresh seek for the newly decoded tracks lands on the next keyframe
 -- (up to ~10s ahead), so seek back to the exact position. The seek has to
@@ -148,6 +163,10 @@ local function apply(live)
     local pos = live and mp.get_property_number("time-pos")
     mp.set_property("lavfi-complex", want and graph() or "")
     ours = want
+    if live then
+        mp.unregister_event(reselect_subs)
+        mp.register_event("playback-restart", reselect_subs)
+    end
     -- Back to normal playback: keep the left-ear / first-pair language.
     if not want and left then mp.set_property_number("aid", left) end
     if pos then
@@ -247,8 +266,8 @@ if pairs_mode then
 end
 
 mp.add_key_binding("a", "toggle", toggle)
-mp.add_key_binding("[", "cycle-left", function() cycle("left") end)
-mp.add_key_binding("]", "cycle-right", function() cycle("right") end)
+mp.add_key_binding("{", "cycle-left", function() cycle("left") end)
+mp.add_key_binding("}", "cycle-right", function() cycle("right") end)
 mp.add_key_binding("y", "swap", swap)
 mp.add_key_binding("h", "balance-left", function() nudge(-opts.balance_step) end)
 mp.add_key_binding("k", "balance-right", function() nudge(opts.balance_step) end)
