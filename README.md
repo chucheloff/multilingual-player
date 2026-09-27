@@ -65,7 +65,8 @@ mkdir -p ~/.config/mpv/scripts && ln -s "$PWD/scripts/dual_audio.lua" ~/.config/
 Optional defaults in `~/.config/mpv/script-opts/dual_audio.conf`:
 
 ```ini
-auto=yes            # turn on for every file with 2+ audio tracks
+# turn on for every file with 2+ audio tracks (comments need their own line)
+auto=yes
 left_lang=eng,en
 right_lang=rus,ru
 balance_step=2
