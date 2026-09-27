@@ -5,6 +5,8 @@ Usage: analyze.py FILE
 Prints one line per channel: "ch<N> <freq>" where freq is the loudest of the
 sample tones (440/1000/2500 Hz), or "silent". Uses ffmpeg for decoding and a
 Goertzel filter for tone energy, so it needs nothing beyond the stdlib.
+For samples/sync.mkv (a beep a second) onsets() and peaks() give when each
+channel's beeps start (first_onsets(): the first one) and how loud they are.
 """
 import array
 import math
@@ -33,25 +35,43 @@ def goertzel(samples, freq):
 
 
 def decode(path):
+    """Channel count and interleaved float samples at RATE."""
     raw = subprocess.check_output(
         ["ffmpeg", "-v", "error", "-i", path, "-f", "f32le",
          "-ar", str(RATE), "-"])
-    return array.array("f", raw)
+    return channel_count(path), array.array("f", raw)
 
 
-def onsets(path):
+def onsets(path, level=0.05, gap=0.05):
+    """Per channel, the times (s) where a beep starts: the signal gets past
+    `level` after at least `gap` s below it."""
+    n, pcm = decode(path)
+    result = [[] for _ in range(n)]
+    last = [-RATE] * n  # sample of each channel's last loud moment
+    for i in range(len(pcm)):
+        if abs(pcm[i]) > level:
+            ch, t = i % n, i // n
+            if t - last[ch] > gap * RATE:
+                result[ch].append(t / RATE)
+            last[ch] = t
+    return result
+
+
+def first_onsets(path):
     """Seconds into the file where each channel first gets loud (None if never),
     e.g. the first beep of samples/sync.mkv."""
-    n = channel_count(path)
-    pcm = decode(path)
-    loud = (next((i for i in range(ch, len(pcm), n) if abs(pcm[i]) > 0.05), None) for ch in range(n))
-    return [None if i is None else i // n / RATE for i in loud]
+    return [times[0] if times else None for times in onsets(path)]
+
+
+def peaks(path, start=0.5):
+    """Per channel, the loudest sample from `start` s on."""
+    n, pcm = decode(path)
+    return [max(map(abs, pcm[int(start * RATE) * n + ch::n])) for ch in range(n)]
 
 
 def tones(path):
     """Loudest sample tone per channel (None where the channel is silent)."""
-    n = channel_count(path)
-    pcm = decode(path)
+    n, pcm = decode(path)
     result = []
     for ch in range(n):
         start = SKIP * n + ch

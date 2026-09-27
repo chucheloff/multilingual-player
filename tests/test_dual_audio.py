@@ -64,6 +64,11 @@ def ao_inits(log):
     return read(log).count("] AO: [")
 
 
+def af_graph(mpv):
+    """The graph string of the script's --af filter: what mpv builds it from."""
+    return next(f["params"]["graph"] for f in mpv.get("af") if f.get("label") == "dual_audio")
+
+
 def devices_file(tmpdir):
     """Keeps the remembered loudness and delay in the test's temp dir. Goes
     after the other script options: a plain --script-opts replaces them all."""
@@ -167,10 +172,10 @@ class Render(unittest.TestCase):
         # Delays saved per ear come back at launch and move that ear against
         # the picture: the first beep after 0.5 s (with the flash) comes
         # that much later or, negative, earlier. Both ways round, as the
-        # graph orders its inputs by delay.
+        # side held back changes.
         def beeps():
             return self.render("--script-opts=dual_audio-auto=yes", "--start=0.5", src=SYNC,
-                               video=True, analyse=analyze.onsets)
+                               video=True, analyse=analyze.first_onsets)
         plain = beeps()
         for delays in ((-200, 0), (100, -300)):
             self.save({"system output (left ear)": {"gain": 0, "delay": delays[0]},
@@ -179,7 +184,7 @@ class Render(unittest.TestCase):
             self.assertEqual(moved, [d / 1000 for d in delays])
 
     def test_pairs_keep_their_channels_when_held_back(self):
-        # A delayed first pair goes into the join second, and still to 1-2.
+        # A delayed first pair still plays on 1-2.
         self.save({"system output (pair 1)": {"gain": 0, "delay": 100}})
         self.assertEqual(self.render("--script-opts=dual_audio-auto=yes,dual_audio-mode=pairs",
                                      "--audio-channels=quad"), [440, 440, 1000, 1000])
@@ -189,7 +194,8 @@ class Mpv:
     """A real-time mpv instance driven over its JSON IPC socket. `cmd` can put
     dualplay in front of it (with the file in `cmd` and src=None). The
     remembered device settings go to devices.json in `store` (default: tmpdir;
-    False: wherever the plugin puts them by default)."""
+    False: wherever the plugin puts them by default). Events that arrive
+    meanwhile are kept in `events` (names only)."""
 
     def __init__(self, tmpdir, *opts, src=TONES, cmd=BASE, env=None, store=None):
         self.path = os.path.join(tmpdir, "mpv.sock")
@@ -208,6 +214,7 @@ class Mpv:
         self.sock.connect(self.path)
         self.buf = b""
         self.next_id = 0
+        self.events = []
 
     def command(self, *args):
         self.next_id += 1
@@ -217,7 +224,9 @@ class Mpv:
                 self.buf += self.sock.recv(65536)
             line, self.buf = self.buf.split(b"\n", 1)
             reply = json.loads(line)
-            if reply.get("request_id") == self.next_id:
+            if "event" in reply:
+                self.events.append(reply["event"])
+            elif reply.get("request_id") == self.next_id:
                 return reply.get("data")
 
     def get(self, prop):
@@ -287,8 +296,15 @@ class Playing(unittest.TestCase):
     def state(self):
         return self.mpv.get("user-data/dual_audio")
 
-    def graph_has(self, *parts):
-        self.mpv.wait_for(lambda: all(p in self.mpv.get("lavfi-complex") for p in parts))
+    def wait_sides(self, want):
+        """Wait until the state gives each side's (gain, delay) as `want`."""
+        self.mpv.wait_for(lambda: [(s["gain"], s["delay"]) for s in self.state()["sides"]] == want)
+
+    def af_graph(self):
+        return af_graph(self.mpv)
+
+    def af_has(self, *parts):
+        self.mpv.wait_for(lambda: all(p in af_graph(self.mpv) for p in parts))
 
 
 class Keys(Playing):
@@ -357,11 +373,10 @@ class Keys(Playing):
     def test_balance(self):
         self.press("a", (1, 2))
         self.mpv.command("keypress", "k")
-        self.mpv.wait_for(lambda: "volume=-2dB[l]" in self.mpv.get("lavfi-complex"))
+        self.wait_sides([(-2, 0), (0, 0)])
         self.mpv.command("keypress", "h")
         self.mpv.command("keypress", "h")
-        self.mpv.wait_for(lambda: "volume=-2dB[r]" in self.mpv.get("lavfi-complex"))
-        self.assertIn("volume=0dB[l]", self.mpv.get("lavfi-complex"))
+        self.wait_sides([(0, 0), (-2, 0)])
 
     def test_menu_messages(self):
         # What the bubbaTV menu sends, and the state it reads back.
@@ -372,26 +387,27 @@ class Keys(Playing):
         self.message("set-track", 1, 3)
         self.expect((3, 1))
         self.message("set-gain", 2, -6)
-        self.mpv.wait_for(lambda: "volume=-6dB[r]" in self.mpv.get("lavfi-complex"))
         self.message("set-delay", 2, 150)
-        self.mpv.wait_for(lambda: "adelay=150:all=1,volume=-6dB[r]" in self.mpv.get("lavfi-complex"))
+        self.wait_sides([(0, 0), (-6, 150)])
         self.expect((3, 1))
         sides = self.state()["sides"]
-        self.assertEqual([(s["track"], s["gain"], s["delay"]) for s in sides],
-                         [(3, 0, 0), (1, -6, 150)])
+        self.assertEqual([s["track"] for s in sides], [3, 1])
         self.assertEqual([s["name"] for s in sides], ["Left ear", "Right ear"])
 
     def test_negative_delay_leaves_audio_delay(self):
-        # The graph can only hold a side back: the other side is delayed
+        # adelay can only hold a side back: the other side is delayed
         # instead, and asetpts moves the output earlier. mpv's own
-        # audio-delay (the user's 0.1 s here) is left alone.
+        # audio-delay (the user's 0.1 s here) is left alone, live too.
         self.mpv.command("set_property", "audio-delay", 0.1)
         self.press("a", (1, 2))
         self.message("set-delay", 1, -200)
-        self.graph_has("adelay=200:all=1,volume=0dB[r]", "asetpts=PTS-0.2/TB[ao]")
-        self.assertNotIn("adelay", self.mpv.get("lavfi-complex").split("[l]")[0])
+        self.wait_sides([(0, -200), (0, 0)])
+        self.message("set-delay", 1, -50)
+        self.wait_sides([(0, -50), (0, 0)])
         self.assertAlmostEqual(self.mpv.get("audio-delay"), 0.1)
-        self.expect((1, 2))
+        self.press("}", (1, 3))  # a new graph: the --af string has the values
+        self.af_has("delays=0|50,asetpts@dual_audio=PTS-0.05/TB")
+        self.assertAlmostEqual(self.mpv.get("audio-delay"), 0.1)
         self.press("a", None)
         self.assertAlmostEqual(self.mpv.get("audio-delay"), 0.1)
 
@@ -404,7 +420,7 @@ class Keys(Playing):
         self.mpv.command("set_property", "audio-delay", 0.1)
         self.press("a", (1, 2))
         self.message("set-delay", 1, -200)
-        self.graph_has("asetpts=PTS-0.2/TB")
+        self.wait_sides([(0, -200), (0, 0)])
         self.mpv.command("keypress", "Q")  # quit-watch-later
         self.mpv.proc.wait(timeout=10)
         confs = []
@@ -416,7 +432,7 @@ class Keys(Playing):
         self.restart("--watch-later-dir=" + later)
         self.assertAlmostEqual(self.mpv.get("audio-delay"), 0.1)
         self.press("a", (1, 2))
-        self.graph_has("adelay=200:all=1,volume=0dB[r]", "asetpts=PTS-0.2/TB")
+        self.af_has("delays=0|200,asetpts@dual_audio=PTS-0.2/TB")
         self.assertAlmostEqual(self.mpv.get("audio-delay"), 0.1)
 
     def test_settings_remembered(self):
@@ -426,14 +442,15 @@ class Keys(Playing):
         self.press("a", (1, 2))
         self.mpv.command("keypress", "h")  # the right ear 2 dB down
         self.message("set-delay", 1, 120)
-        self.graph_has("adelay=120:all=1,volume=0dB[l]", "volume=-2dB[r]")
+        self.wait_sides([(0, 120), (-2, 0)])
         self.assertEqual(self.saved(), {"system output (left ear)": {"gain": 0, "delay": 120},
                                         "system output (right ear)": {"gain": -2, "delay": 0}})
+        remembered = ("volume@dual_audio1=0dB", "volume@dual_audio2=-2dB", "delays=120|0")
         self.next_file()
-        self.graph_has("adelay=120:all=1,volume=0dB[l]", "volume=-2dB[r]")
+        self.af_has(*remembered)
         self.restart()
         self.press("a", (1, 2))
-        self.graph_has("adelay=120:all=1,volume=0dB[l]", "volume=-2dB[r]")
+        self.af_has(*remembered)
         self.assertEqual([(s["gain"], s["delay"]) for s in self.state()["sides"]], [(0, 120), (-2, 0)])
         self.message("set-delay", 1, 0)
         self.message("set-gain", 2, 0)
@@ -447,14 +464,16 @@ class Keys(Playing):
         self.press("a", (1, 2))
         self.message("set-gain", 1, -4)
         self.message("set-delay", 2, -150)
-        self.graph_has("adelay=150:all=1,volume=-4dB[l]", "volume=0dB[r]", "asetpts=PTS-0.15/TB")
+        self.wait_sides([(-4, 0), (0, -150)])
         self.press("y", (2, 1))
-        self.graph_has("adelay=150:all=1,volume=-4dB[l]", "volume=0dB[r]")
+        self.af_has("volume@dual_audio1=-4dB", "volume@dual_audio2=0dB",
+                    "delays=150|150|0|0,asetpts@dual_audio=PTS-0.15/TB")
         self.assertEqual(self.saved(), {"Nikita’s AirPods": {"gain": -4, "delay": 0},
                                         "Friend, Pro": {"gain": 0, "delay": -150}})
         self.restart(pairs, "--script-opts-append=dual_audio-pair_names=Friend, Pro|Nikita’s AirPods")
         self.press("a", (1, 2))
-        self.graph_has("volume=0dB[l]", "adelay=150:all=1,volume=-4dB[r]", "asetpts=PTS-0.15/TB")
+        self.af_has("volume@dual_audio1=0dB", "volume@dual_audio2=-4dB",
+                    "delays=0|0|150|150,asetpts@dual_audio=PTS-0.15/TB")
         self.assertEqual([(s["device"], s["gain"], s["delay"]) for s in self.state()["sides"]],
                          [("Friend, Pro", 0, -150), ("Nikita’s AirPods", -4, 0)])
 
@@ -463,16 +482,16 @@ class Keys(Playing):
         # back to the system output brings its settings back.
         self.press("a", (1, 2))
         self.message("set-gain", 1, -6)
-        self.graph_has("volume=-6dB[l]")
+        self.wait_sides([(-6, 0), (0, 0)])
         self.mpv.command("set_property", "audio-device", "coreaudio/test-uid")
-        self.graph_has("volume=0dB[l]")
+        self.wait_sides([(0, 0), (0, 0)])
         self.expect((1, 2))
         self.message("set-gain", 2, -3)
-        self.graph_has("volume=-3dB[r]")
+        self.wait_sides([(0, 0), (-3, 0)])
         self.assertEqual(self.saved(), {"system output (left ear)": {"gain": -6, "delay": 0},
                                         "coreaudio/test-uid (right ear)": {"gain": -3, "delay": 0}})
         self.mpv.command("set_property", "audio-device", "auto")
-        self.graph_has("volume=-6dB[l]", "volume=0dB[r]")
+        self.wait_sides([(-6, 0), (0, 0)])
 
     def test_default_file_in_config_dir(self):
         # ~~/dual_audio-devices.json: mpv's config dir, made on the first save.
@@ -484,17 +503,181 @@ class Keys(Playing):
         self.mpv.wait_for(lambda: self.mpv.get("time-pos") is not None)
         self.press("a", (1, 2))
         self.message("set-gain", 2, -6)
-        self.graph_has("volume=-6dB[r]")
+        self.wait_sides([(0, 0), (-6, 0)])
         with open(os.path.join(cfg, "dual_audio-devices.json")) as f:
             self.assertEqual(json.load(f), {"system output (right ear)": {"gain": -6, "delay": 0}})
 
     def test_av_sync_while_playing(self):
         self.press("a", (1, 2))
         self.message("set-delay", 2, -200)  # the left ear held back, the output moved earlier
-        self.graph_has("[r][l]join", "asetpts")
+        self.wait_sides([(0, 0), (0, -200)])
         self.mpv.command("set_property", "pause", False)
         time.sleep(3)
         self.assertLess(abs(self.mpv.get("avsync")), 0.1)
+
+    def test_live_while_playing(self):
+        # Loudness and delay changes are live: no graph rebuild, no seek,
+        # and time-pos goes on. A negative delay moves the sound 200 ms
+        # earlier against the picture, which then catches up, and mpv's
+        # audio-delay stays as it was.
+        self.press("a", (1, 2))
+        self.mpv.command("set_property", "pause", False)
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") > 3.3)
+        graph = self.mpv.get("lavfi-complex")
+        self.mpv.events.clear()
+        self.message("set-gain", 2, -6)
+        self.message("set-delay", 1, -200)
+        self.message("set-delay", 2, 100)
+        self.mpv.command("keypress", "k")
+        self.wait_sides([(0, -200), (-4, 100)])
+        positions, sync = [], []
+        end = time.time() + 3.5  # time enough for the picture to catch up
+        while time.time() < end:
+            positions.append(self.mpv.get("time-pos"))
+            sync.append(self.mpv.get("avsync"))
+            time.sleep(0.05)
+        self.assertEqual(self.mpv.get("lavfi-complex"), graph)
+        self.assertEqual([e for e in self.mpv.events if e in ("seek", "playback-restart")], [])
+        self.assertEqual(positions, sorted(positions))
+        self.assertGreater(positions[-1] - positions[0], 2.5)
+        self.assertAlmostEqual(min(sync), -0.2, delta=0.05)
+        self.assertLess(abs(sync[-1]), 0.05)
+        self.assertEqual(self.mpv.get("audio-delay"), 0)
+
+    def test_live_values_after_seek(self):
+        # mpv rebuilds the --af filter from its string after a seek, so the
+        # values changed live must be in it by then; the other side takes
+        # the negative delay.
+        self.press("a", (1, 2))
+        self.mpv.command("set_property", "pause", False)
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") > 3.3)  # long after the toggle's seek back
+        self.message("set-gain", 2, -6)
+        self.message("set-delay", 1, -200)
+        self.wait_sides([(0, -200), (-6, 0)])
+        self.assertIn("delays=0|0,asetpts@dual_audio=PTS+0/TB", self.af_graph())  # live: the string is as before
+        self.mpv.command("seek", 5, "absolute")
+        self.af_has("delays=0|200,asetpts@dual_audio=PTS-0.2/TB")
+        self.assertIn("volume@dual_audio1=0dB", self.af_graph())
+        self.assertIn("volume@dual_audio2=-6dB", self.af_graph())
+
+    def test_own_filters_left_alone(self):
+        # Ours goes first, on the joined channels; the user's come after,
+        # and are all that is left when dual audio goes off.
+        self.restart("--af=@mine:lavfi=[volume=0.5],format=srate=48000")
+        own = self.mpv.get("af")
+        self.press("a", (1, 2))
+        self.assertEqual(self.mpv.get("af")[1:], own)
+        self.message("set-gain", 1, -3)
+        self.wait_sides([(-3, 0), (0, 0)])
+        self.assertEqual(self.mpv.get("af")[1:], own)
+        self.press("a", None)
+        self.assertEqual(self.mpv.get("af"), own)
+
+
+class Live(unittest.TestCase):
+    """Loudness and delay changed during playback, as heard: samples/sync.mkv
+    rendered to a WAV, with the changes sent over IPC while paused at the
+    start. mpv has filtered what its pcm output buffers by then (~1.4 s), so
+    the beeps from 3 s on carry the change."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def render(self, *messages, opts=(), then=()):
+        """The WAV of playing with `messages` sent, then the IPC commands
+        in `then`."""
+        out = os.path.join(self.tmp.name, "out.wav")
+        mpv = Mpv(self.tmp.name, "--ao=pcm", "--ao-pcm-file=" + out, "--untimed", "--pause", "--end=7",
+                  "--script-opts-append=dual_audio-auto=yes", *opts, src=SYNC)
+        try:
+            mpv.wait_for(lambda: mpv.get("seeking") is False)  # started: audio went through the filters
+            time.sleep(0.2)
+            graph = mpv.get("lavfi-complex")
+            mpv.events.clear()  # those of the start
+            for m in messages:
+                mpv.command("script-message-to", "dual_audio", *map(str, m))
+            want = {(m[0][4:], m[1]): m[2] for m in messages}  # e.g. ("delay", side): ms
+            mpv.wait_for(lambda: all(mpv.get("user-data/dual_audio")["sides"][i - 1][k] == v
+                                     for (k, i), v in want.items()))
+            time.sleep(0.3)  # time for a seek, if one came
+            # Live: the graph stays, nothing seeks.
+            self.assertEqual(mpv.get("lavfi-complex"), graph)
+            self.assertEqual([e for e in mpv.events if e in ("seek", "playback-restart")], [])
+            self.audio_delay = mpv.get("audio-delay")
+            for command in then:
+                mpv.command(*command)
+            mpv.command("set_property", "pause", False)
+            mpv.proc.wait(timeout=60)
+        finally:
+            mpv.close()
+        return out
+
+    def assert_after(self, first, then, ms, skip=3):
+        """Leaving out the first `skip` beeps, each beep of `then` starts `ms`
+        after the one of `first`."""
+        self.assertEqual(len(first), len(then))
+        self.assertGreater(len(first), skip + 2)
+        for a, b in zip(first[skip:], then[skip:]):
+            self.assertAlmostEqual((b - a) * 1000, ms, delta=2)
+
+    def test_delay(self):
+        left, right = analyze.onsets(self.render(("set-delay", 2, 200)))
+        self.assert_after(left, right, 200)
+        for t in left:  # the other side stays with the picture: on the second
+            self.assertAlmostEqual(t, round(t), delta=0.002)
+
+    def test_negative_delay(self):
+        # The left ear 200 ms early: the right is delayed instead, and the
+        # sound's timestamps move 200 ms earlier, not mpv's audio-delay.
+        # That shows at the end: --end=7 cuts by timestamp, so the WAV runs
+        # to 7.2 s of the sound, a beep more on the left.
+        out = self.render(("set-delay", 1, -200))
+        left, right = analyze.onsets(out)
+        self.assert_after(left[:-1], right, 200)
+        n, pcm = analyze.decode(out)
+        self.assertAlmostEqual(len(pcm) / n / analyze.RATE, 7.2, delta=0.005)
+        self.assertEqual(self.audio_delay, 0)
+
+    def test_loudness(self):
+        left, right = analyze.peaks(self.render(("set-gain", 2, -6)), start=3)
+        self.assertAlmostEqual(right / left, 10 ** (-6 / 20), delta=0.01)
+
+    def test_pairs(self):
+        # Both channels of a pair change together.
+        out = self.render(("set-delay", 2, 150), ("set-gain", 1, -6),
+                          opts=("--script-opts-append=dual_audio-mode=pairs", "--audio-channels=quad"))
+        fl, fr, bl, br = analyze.onsets(out)
+        self.assert_after(fl, fr, 0)
+        self.assert_after(fl, bl, 150)
+        self.assert_after(fl, br, 150)
+        fl, fr, bl, br = analyze.peaks(out, start=3)
+        self.assertAlmostEqual(fl / bl, 10 ** (-6 / 20), delta=0.01)
+        self.assertAlmostEqual(fr / br, 10 ** (-6 / 20), delta=0.01)
+
+    def test_kept_after_seek(self):
+        # mpv rebuilds the filter after a seek; the live values come along.
+        # The WAV then starts at 3 s and holds four beeps. The first is left
+        # out: should mpv get to it before the script hears of the seek, it
+        # still has the old values.
+        out = self.render(("set-delay", 2, 200), ("set-gain", 2, -6), then=[("seek", 3, "absolute")])
+        left, right = analyze.onsets(out)
+        self.assertEqual(len(left), 4)
+        self.assert_after(left, right, 200, skip=1)
+        left, right = analyze.peaks(out, start=0.5)
+        self.assertAlmostEqual(right / left, 10 ** (-6 / 20), delta=0.01)
+
+    def test_output_brings_its_settings(self):
+        # In ears mode another output device has settings of its own (saved
+        # before here), and they are heard once mpv plays to it. The WAV
+        # starts again there too.
+        with open(os.path.join(self.tmp.name, "devices.json"), "w") as f:
+            json.dump({"coreaudio/test-uid (right ear)": {"gain": -6, "delay": 0}}, f)
+        out = self.render(then=[("set_property", "audio-device", "coreaudio/test-uid")])
+        left, right = analyze.peaks(out, start=3)
+        self.assertAlmostEqual(right / left, 10 ** (-6 / 20), delta=0.01)
 
 
 class Devices(unittest.TestCase):
@@ -529,9 +712,6 @@ class Devices(unittest.TestCase):
 
     def wait_logged(self, text):
         self.mpv.wait_for(lambda: text in read(self.log))
-
-    def graph_has(self, *parts):
-        self.mpv.wait_for(lambda: all(p in self.mpv.get("lavfi-complex") for p in parts))
 
     def wait_lost(self, lost):
         self.mpv.wait_for(lambda: [s.get("lost", False) for s in self.sides()] == lost)
@@ -568,17 +748,15 @@ class Devices(unittest.TestCase):
         # Loudness and delay stay with the headphones: after a swap they are
         # on the other pair, and headphones new to a pair bring their own.
         self.message("set-gain", 2, -6)
-        self.graph_has("volume=0dB[l]", "volume=-6dB[r]")
+        self.mpv.wait_for(lambda: [s["gain"] for s in self.sides()] == [0, -6])
         self.message("set-device", 1, "Friend, Pro")
         self.mpv.wait_for(lambda: self.devices() == ["Friend, Pro", "Nikita’s AirPods"])
-        self.graph_has("volume=-6dB[l]", "volume=0dB[r]")
-        self.assertEqual([s["gain"] for s in self.sides()], [-6, 0])
+        self.mpv.wait_for(lambda: [s["gain"] for s in self.sides()] == [-6, 0])
         self.message("set-delay", 2, 120)  # Nikita's
-        self.graph_has("adelay=120:all=1,volume=0dB[r]")
+        self.mpv.wait_for(lambda: [s["delay"] for s in self.sides()] == [0, 120])
         self.message("set-device", 2, "Other Phones")
         self.mpv.wait_for(lambda: self.devices() == ["Friend, Pro", "Other Phones"])
-        self.graph_has("volume=-6dB[l]", "volume=0dB[r]")
-        self.assertNotIn("adelay", self.mpv.get("lavfi-complex"))
+        self.mpv.wait_for(lambda: [(s["gain"], s["delay"]) for s in self.sides()] == [(-6, 0), (0, 0)])
         self.mpv.wait_for(lambda: abs(self.mpv.get("time-pos") - 3.0) < 0.05)
         with open(os.path.join(self.tmp.name, "devices.json")) as f:
             self.assertEqual(json.load(f), {"Friend, Pro": {"gain": -6, "delay": 0},
@@ -743,18 +921,20 @@ class FollowSubs(Playing):
         self.shows("Eng", "Rus")
 
     def test_keep_coming_after_graph_change(self):
-        # A loudness change rebuilds the graph but keeps the tracks: both
-        # subtitles must be selected anew all the same (see Subs).
+        # A swap rebuilds the graph: both subtitles must be selected anew
+        # (see Subs). A loudness change before it is live and leaves them be.
         self.start(FOLLOW, "--cache=no", "--demuxer-readahead-secs=0.5", "--demuxer-max-bytes=1MiB",
                    "--demuxer-max-back-bytes=0")
         self.shows("Eng", "Rus")
         self.mpv.command("set_property", "pause", False)
         self.message("set-gain", 1, -3)
-        self.mpv.wait_for(lambda: "volume=-3dB[l]" in self.mpv.get("lavfi-complex"))
+        self.wait_sides([(-3, 0), (0, 0)])
+        self.mpv.command("keypress", "y")
+        self.mpv.wait_for(lambda: [s.get("track") for s in self.state()["sides"]] == [2, 1])
         start = self.mpv.get("time-pos")
         self.mpv.wait_for(lambda: self.mpv.get("time-pos") > start + 2.5, timeout=15)
-        self.assertRegex(self.mpv.get("sub-text"), r"^Eng \d+$")
-        self.assertRegex(self.mpv.get("secondary-sub-text"), r"^Rus \d+$")
+        self.assertRegex(self.mpv.get("sub-text"), r"^Rus \d+$")
+        self.assertRegex(self.mpv.get("secondary-sub-text"), r"^Eng \d+$")
 
 
 class Menu(unittest.TestCase):

@@ -101,9 +101,12 @@ dual audio on it has a group per pair (or ear):
 - **Delay** — −1000 … +1000 ms, on top of mpv's audio delay (`Ctrl+-` / `Ctrl++`)
 
 plus switches for dual audio on/off, swapping the pairs and
-**Subtitles follow pairs** (below). The sliders apply
-a moment after you let go (each change briefly restarts the sound); click a
-value to reset it to 0.
+**Subtitles follow pairs** (below). Loudness and delay change as you drag,
+without restarting the sound, so you can tune them by ear while the movie
+plays: a delay change makes that pair skip or pause for the difference, and
+when the earlier pair's delay changes, the picture runs a little slower or
+faster for a couple of seconds to catch up. Click a value to reset it to 0.
+Picking a track still restarts the sound for a moment.
 
 The menu is a native mpv plugin (`tools/bubbatv-menu.swift`). `dualplay`
 compiles it on first run with `swiftc` (`xcode-select --install`) against the
@@ -226,19 +229,25 @@ mpv's `--lavfi-complex` feeds several tracks of one file into one ffmpeg filter
 graph. The plugin builds this graph:
 
 ```
-[aid1] → resample → mono → volume ─┐
-                                   ├─ join → [left, right] → output
-[aid2] → resample → mono → volume ─┘
+[aid1] → resample → mono ─┐
+                          ├─ join → [left, right] → volume, delay per side → output
+[aid2] → resample → mono ─┘
+         └────────── --lavfi-complex ───────────┘   └─ --af @dual_audio ─┘
 ```
 
 With `-2` each track stays stereo and the join gives four channels
-(FL FR BL BR). A pair's loudness is its `volume`. For the delays an `adelay`
-holds the later pair back by the difference, and `asetpts` after the join
-moves both by the earlier pair's delay (earlier, for a negative one). That
-leaves mpv's own audio delay alone, which mpv saves for the next start on
-`Shift+Q`. The held-back pair goes into the join second: `join` takes its
-timestamps from its first input, and `adelay`'s leading silence has none.
-When both sides play one track, `asplit` feeds it to both. `tools/audio-pairs.swift` combines the two headphone outputs
+(FL FR BL BR). When both sides play one track, `asplit` feeds it to both.
+Each side's loudness (`volume`) and delay come after the join, in an `--af`
+filter labelled `@dual_audio`, in front of any audio filters of your own.
+mpv's `af-command` changes them there while the movie plays: no rebuild, no
+seek, no gap. (It can't reach filters inside `--lavfi-complex`.) For the
+delays an `adelay` holds the later side back by the difference, and
+`asetpts` moves both by the earlier side's delay (earlier, for a negative
+one); the earlier side is never held back itself, as `adelay`'s leading
+silence would have no timestamps. That leaves mpv's own audio delay alone,
+which mpv saves for the next start on `Shift+Q`. mpv rebuilds `--af` filters
+on a seek, so the plugin writes the current values into its filter's
+settings at the next seek. `tools/audio-pairs.swift` combines the two headphone outputs
 into one CoreAudio *aggregate device*: channels 1–2 go to the first pair, 3–4
 to the second. The second pair follows the first one's clock (drift
 correction). The device exists only while `dualplay` runs.
@@ -258,9 +267,9 @@ Why not a VLC plugin: VLC decodes only one audio track at a time, so a VLC
 audio filter never sees the second language. Doing this in VLC means patching
 its C core.
 
-One mpv quirk is worked around: changing the graph during playback makes mpv
-jump to the next keyframe (up to ~10 s ahead), so the plugin drops mpv's
-buffers and seeks back to the exact position.
+One mpv quirk is worked around: changing the graph during playback (a track
+switch, dual audio on/off) makes mpv jump to the next keyframe (up to ~10 s
+ahead), so the plugin drops mpv's buffers and seeks back to the exact position.
 
 ## Tests
 
@@ -271,8 +280,11 @@ python3 tests/test_dual_audio.py
 Generates `samples/` (via `tools/make-samples.sh`): `tones.mkv` has a
 distinct sine tone per track, and the tests play it through mpv and check which
 tone lands in which channel, including key presses sent over mpv's IPC socket,
-and which subtitle lines show for which pair; `sync.mkv` shows when each ear's
-beeps arrive. Remembered settings and watch-later files go to temp dirs.
+and which subtitle lines show for which pair. `sync.mkv` beeps once a second
+on both tracks: the tests check when each ear's beeps arrive, change a delay
+or loudness during playback and measure when and how loud each channel's
+beeps come out, and that nothing seeks. Remembered settings and watch-later
+files go to temp dirs.
 With `swiftc` they also build the bubbaTV menu, load it into mpv and click
 through it (`tests/menu_clicks/`). They build bubbaTV.app too and check the
 command its `--dry-run` prints.
