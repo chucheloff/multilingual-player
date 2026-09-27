@@ -31,4 +31,12 @@ plutil -replace BubbaTVDualplay -string "$repo/dualplay" "$plist"
 plutil -replace BubbaTVPath -string "$PATH:/opt/homebrew/bin:/usr/local/bin" "$plist"
 swiftc -O -o "$app/Contents/MacOS/bubbaTV" "$repo/tools/bubbatv-app.swift"
 codesign --force --sign - "$app"
+# In an Applications folder, tell Launch Services right away, so Finder offers
+# bubbaTV under Open With before it has ever been opened. Builds elsewhere
+# (tools/.build, the tests' temp dirs) stay unregistered, or Open With would
+# list every stale copy.
+lsregister=${LSREGISTER:-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister}
+case $(cd "$(dirname "$app")" && pwd) in
+  /Applications | "$HOME/Applications") "$lsregister" -f "$app" ;;
+esac
 echo "built $app"

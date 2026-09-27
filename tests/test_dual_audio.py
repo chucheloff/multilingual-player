@@ -1580,7 +1580,18 @@ class App(unittest.TestCase):
         cls.app = os.path.join(cls.build.name, "bubbaTV.app")
         # Built from a shell without Homebrew in its PATH: the app still finds mpv.
         cls.path = "/usr/bin:/bin:" + os.path.join(cls.build.name, "bin")
-        subprocess.run([os.path.join(ROOT, "tools", "make-app.sh"), cls.app], env=dict(os.environ, PATH=cls.path),
+        # Stands in for Launch Services' lsregister: it only notes its arguments.
+        cls.registered = os.path.join(cls.build.name, "registered")
+        cls.lsregister = os.path.join(cls.build.name, "lsregister")
+        with open(cls.lsregister, "w") as f:
+            f.write('#!/bin/sh\necho "$@" >> "%s"\n' % cls.registered)
+        os.chmod(cls.lsregister, 0o755)
+        cls.make_app(cls.app)
+
+    @classmethod
+    def make_app(cls, app, **env):
+        subprocess.run([os.path.join(ROOT, "tools", "make-app.sh"), app],
+                       env=dict(os.environ, PATH=cls.path, LSREGISTER=cls.lsregister, **env),
                        check=True, capture_output=True, timeout=300)
 
     @classmethod
@@ -1616,6 +1627,17 @@ class App(unittest.TestCase):
                             os.path.join(app, "Contents", "Info.plist")], check=True)
         return subprocess.run([os.path.join(app, "Contents", "MacOS", "bubbaTV"), "--dry-run", *files],
                               capture_output=True, text=True, timeout=60)
+
+    def test_open_with_right_away(self):
+        # Built into an Applications folder, the app is registered with Launch
+        # Services at once, so Finder offers it under Open With before it was
+        # ever opened. The build in a temp dir above was not registered.
+        self.assertFalse(os.path.exists(self.registered))
+        home = os.path.join(self.tmp.name, "home")
+        app = os.path.join(home, "Applications", "bubbaTV.app")
+        self.make_app(app, HOME=home)
+        with open(self.registered) as f:
+            self.assertEqual(f.read(), "-f %s\n" % app)
 
     def test_bundle(self):
         subprocess.run(["plutil", "-lint", os.path.join(self.app, "Contents", "Info.plist")],
