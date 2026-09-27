@@ -2,34 +2,49 @@
 # dualplay - play a video with two audio tracks at once.
 #
 # Usage: dualplay [-2] [-p NAME -p NAME] [-l LANGS] [-r LANGS] FILE [mpv options...]
+#        dualplay -L
 #   -l LANGS  languages for the left ear (with -2: first pair), e.g. "eng,en"
 #   -r LANGS  languages for the right ear (with -2: second pair), e.g. "rus,ru"
 #   -2        two headphone pairs: a stereo track on each, using the two
 #             connected Bluetooth outputs
 #   -p NAME   with -2, use this output (part of its name) instead; give it twice
+#   -L        list the connected outputs (names for -p) and exit
 # Without -l/-r the track that would normally play comes first, the next one second.
 set -euo pipefail
 
-usage() { sed -n '4,12s/^# \{0,1\}//p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '4,13s/^# \{0,1\}//p' "$0"; exit "${1:-0}"; }
 
-left="" right="" pairs="" names=()
-while getopts "l:r:2p:h" opt; do
+left="" right="" pairs="" list="" names=()
+while getopts "l:r:2p:Lh" opt; do
   case $opt in
     l) left=$OPTARG ;;
     r) right=$OPTARG ;;
     2) pairs=1 ;;
     p) names+=("$OPTARG") ;;
+    L) list=1 ;;
     h) usage ;;
     *) usage 1 ;;
   esac
 done
 shift $((OPTIND - 1))
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+
+# The helper that finds and combines the outputs (-2, -L) is compiled on first use.
+helper="$here/tools/.build/audio-pairs"
+build_helper() {
+  if [ ! -x "$helper" ] || [ "$here/tools/audio-pairs.swift" -nt "$helper" ]; then
+    command -v swiftc >/dev/null || { echo "dualplay: -2 and -L need swiftc - xcode-select --install" >&2; exit 1; }
+    mkdir -p "$here/tools/.build"
+    swiftc -O -o "$helper" "$here/tools/audio-pairs.swift"
+  fi
+}
+if [ -n "$list" ]; then build_helper; exec "$helper" list; fi
+
 [ $# -ge 1 ] || usage 1
 [ ${#names[@]} -eq 0 ] || [ ${#names[@]} -eq 2 ] || { echo "dualplay: give -p twice" >&2; exit 1; }
 
 command -v mpv >/dev/null || { echo "dualplay: mpv not found - brew install mpv" >&2; exit 1; }
 
-here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 scripts="${MPV_HOME:-$HOME/.config/mpv}/scripts"
 args=()
 # Skip --script if the plugin is already installed, or mpv would load it twice.
@@ -62,13 +77,8 @@ args+=(--script-opts-append=dual_audio-auto=yes)
 [ -n "$pairs" ] || exec mpv "${args[@]}" "$@"
 
 # Two pairs: combine both outputs into one 4-channel device for the length
-# of the movie. The helper is compiled on first use.
-helper="$here/tools/.build/audio-pairs"
-if [ ! -x "$helper" ] || [ "$here/tools/audio-pairs.swift" -nt "$helper" ]; then
-  command -v swiftc >/dev/null || { echo "dualplay: -2 needs swiftc - xcode-select --install" >&2; exit 1; }
-  mkdir -p "$here/tools/.build"
-  swiftc -O -o "$helper" "$here/tools/audio-pairs.swift"
-fi
+# of the movie.
+build_helper
 info=$("$helper" create ${names[@]+"${names[@]}"})
 trap '"$helper" destroy' EXIT
 trap 'exit 130' INT TERM  # make sure Ctrl+C still runs the EXIT trap

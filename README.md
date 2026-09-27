@@ -7,7 +7,8 @@ Watch a movie with a friend in two languages at once, on one Mac:
 
 It's a plugin for [mpv](https://mpv.io) (`scripts/dual_audio.lua`) plus a
 small launcher (`dualplay`), with a **bubbaTV** menu in mpv's menu bar for
-each pair's track, loudness and delay, and subtitles in both languages.
+each pair's track, loudness and delay, and subtitles in both languages. The
+**bubbaTV** app starts a movie without the terminal.
 
 ## Quick start
 
@@ -25,6 +26,34 @@ bubbaTV menu. Both sides can play the same track, e.g. `-l eng -r eng`. Without 
 would normally play comes first and the next one second. Any other mpv option works after
 the file name, e.g. `--sub-lang=eng`.
 
+## bubbaTV.app: without the terminal
+
+```sh
+tools/make-app.sh ~/Applications/bubbaTV.app
+```
+
+Then drop a movie on **bubbaTV** (keep it in the Dock, or in Finder), or
+right-click a movie → Open With → bubbaTV. Opened on its own, it offers to pick
+one. It plays with `dualplay`: on two pairs (`-2`) when two Bluetooth
+headphones are connected, otherwise on one shared pair, an ear each. The
+languages are `left_lang` / `right_lang` from `dual_audio.conf` (see
+[Install as a plugin](#install-as-a-plugin)); without them, the track that
+would normally play comes first. Several files play as a playlist, in name
+order. bubbaTV quits when mpv does, and quitting bubbaTV stops mpv.
+
+- It is only offered under Open With: it never becomes the default app for movies.
+- Problems (mpv not installed, nothing to play, playback failing) show up in an alert.
+  mpv's output is in `~/Library/Logs/bubbaTV.log`.
+- The app runs `dualplay` from this folder (the path is built in), so a
+  `git pull` here updates it too, and what `dualplay` compiles stays in
+  `tools/.build`, not in the app. If you move the folder, run `make-app.sh`
+  again. The app also keeps the `PATH` of the shell that built it, so it finds
+  `mpv` and `swiftc` as that shell does.
+- Without an argument `make-app.sh` builds `tools/.build/bubbaTV.app`. To see
+  what the app would run: `~/Applications/bubbaTV.app/Contents/MacOS/bubbaTV --dry-run movie.mkv`.
+- If macOS asks whether bubbaTV may access a folder (Downloads, Documents…),
+  allow it: mpv reads the movie on its behalf.
+
 ## Two pairs of AirPods
 
 1. Connect both pairs to the Mac (Control Center → Bluetooth, click each).
@@ -35,7 +64,7 @@ the file name, e.g. `--sub-lang=eng`.
    does the on-screen message. Press `y` if it's the wrong way round.
 
 Other headphones or speakers work too: `-2` picks the two connected Bluetooth
-outputs, or name them with `-p`, e.g.
+outputs, or name them with `-p` (`./dualplay -L` lists the outputs), e.g.
 `./dualplay -2 -p "Nikita" -p "MacBook Pro Speakers" movie.mkv`.
 
 Volume: `9` / `0` changes both, `h` / `k` makes one pair quieter than the other,
@@ -186,7 +215,8 @@ distinct sine tone per track, and the tests play it through mpv and check which
 tone lands in which channel, including key presses sent over mpv's IPC socket,
 and which subtitle lines show for which pair.
 With `swiftc` they also build the bubbaTV menu, load it into mpv and click
-through it (`tests/menu_clicks/`).
+through it (`tests/menu_clicks/`). They build bubbaTV.app too and check the
+command its `--dry-run` prints.
 For listening: `samples/speech.mkv` (English and Russian speech) and
 `samples/sync.mkv` (flash + beep).
 
