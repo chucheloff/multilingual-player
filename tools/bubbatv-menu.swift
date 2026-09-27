@@ -1,6 +1,7 @@
 // bubbatv - the "bubbaTV" menu in mpv's menu bar, for scripts/dual_audio.lua:
 // for each headphone pair (or ear) its device, audio track, loudness and delay,
-// and whether the subtitles follow the pairs' languages.
+// whether the subtitles follow the pairs' languages, and a sync pattern to set
+// the delays by.
 //
 // An mpv C plugin: a library mpv loads with --script=bubbatv.so. dualplay
 // builds and loads it; by hand:
@@ -34,6 +35,7 @@ struct Side: Sendable {
 /// What dual_audio.lua publishes; `loaded` is false while it hasn't (yet).
 struct State: Sendable {
     var loaded = false, enabled = false, active = false, pairs = false, followSubs = false
+    var calibrating = false    // the sync pattern plays instead of the movie
     var switchDevices = false  // dualplay -2: a pair can move to other headphones
     var tracks: [Track] = []
     var sides: [Side] = []
@@ -49,6 +51,7 @@ struct State: Sendable {
         pairs = o["mode"] as? String == "pairs"
         followSubs = o["follow_subs"] as? Bool ?? false
         switchDevices = o["switch_devices"] as? Bool ?? false
+        calibrating = o["calibrating"] as? Bool ?? false
         tracks = (o["tracks"] as? [[String: Any]] ?? []).compactMap { t in
             guard let id = t["id"] as? Int else { return nil }
             return Track(id: id, title: t["title"] as? String ?? "[\(id)]")
@@ -313,6 +316,7 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
         }
         if state.active {
             menu.addItem(.separator())
+            menu.addItem(item(state.calibrating ? "Done calibrating" : "Calibrate delay…", #selector(calibrate)))
             menu.addItem(item(state.pairs ? "Swap pairs" : "Swap ears", #selector(swap)))
             let subs = item(state.pairs ? "Subtitles follow pairs" : "Subtitles follow ears", #selector(followSubs))
             subs.state = state.followSubs ? .on : .off
@@ -381,6 +385,7 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
     @objc private func toggle() { mpv.command("script-binding", "dual_audio/toggle") }
     @objc private func swap() { mpv.command("script-binding", "dual_audio/swap") }
     @objc private func followSubs() { mpv.command("script-binding", "dual_audio/follow-subs") }
+    @objc private func calibrate() { mpv.command("script-binding", "dual_audio/calibrate") }
 
     @objc private func pick(_ sender: NSMenuItem) {
         guard let v = sender.representedObject as? [Int] else { return }
