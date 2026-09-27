@@ -69,6 +69,13 @@ def af_graph(mpv):
     return next(f["params"]["graph"] for f in mpv.get("af") if f.get("label") == "dual_audio")
 
 
+def episode(path):
+    """A short copy of the tones (5 s) at path, standing in for an episode."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    subprocess.run(["ffmpeg", "-v", "error", "-i", TONES, "-map", "0", "-t", "5", "-c", "copy", path], check=True)
+    return path
+
+
 def devices_file(tmpdir):
     """Keeps the remembered loudness and delay in the test's temp dir. Goes
     after the other script options: a plain --script-opts replaces them all."""
@@ -1375,6 +1382,40 @@ class Menu(unittest.TestCase):
         self.mpv.command("script-binding", "dual_audio/follow-subs")
         self.wait_menu("Swap pairs\n[x] Subtitles follow pairs")
 
+    def test_playback_section(self):
+        # With 2+ files, dual audio on or off: previous / next file and the
+        # playlist by file name - with the folder where two share a name -
+        # after Back / Forward.
+        self.mpv.wait_for(lambda: self.menu() == "Dual audio\n---\nPlayback\nBack 5 s\nForward 5 s")  # one file
+        for name in ("S1/Ep 1.mkv", "S1/Ep 2.mkv", "S2/Ep 1.mkv"):
+            self.mpv.command("loadfile", episode(os.path.join(self.tmp.name, name)), "append")
+        self.wait_menu("Dual audio\n---\nPlayback\nBack 5 s\nForward 5 s\nPrevious file (disabled)\nNext file\n"
+                       "Files\n  [x] tones.mkv\n  Ep 1.mkv (S1)\n  Ep 2.mkv\n  Ep 1.mkv (S2)")
+        self.mpv.command("keypress", "a")  # below the dual audio settings
+        self.wait_menu("Subtitles follow pairs\n---\nPlayback\nBack 5 s\nForward 5 s\nPrevious file (disabled)\n")
+        self.mpv.command("playlist-play-index", 3)
+        self.wait_menu("Playback\nBack 5 s\nForward 5 s\nPrevious file\nNext file (disabled)\nFiles\n"
+                       "  tones.mkv\n  Ep 1.mkv (S1)\n  Ep 2.mkv\n  [x] Ep 1.mkv (S2)")
+        self.assertTrue(self.menu().endswith("[x] Ep 1.mkv (S2)"))
+
+    def test_playback_without_script(self):
+        # The files don't need dual_audio.lua (the plugin reads mpv's
+        # playlist); Back / Forward do.
+        self.mpv.close()
+        files = [episode(os.path.join(self.tmp.name, "Ep %d.mkv" % i)) for i in (1, 2)]
+        self.mpv = Mpv(self.tmp.name, "--script=" + self.plugin, "--pause", *files, src=None,
+                       cmd=["mpv", "--no-config", "--vo=null", "--really-quiet"])
+        self.mpv.wait_for(lambda: self.menu() == "Dual audio (disabled)\ndual_audio.lua is not loaded (disabled)\n"
+                          "---\nPlayback\nPrevious file (disabled)\nNext file\nFiles\n  [x] Ep 1.mkv\n  Ep 2.mkv")
+
+    def test_playback_clicks(self):
+        # Next file, a pick from Files and Previous file in the real menu.
+        files = [episode(os.path.join(self.tmp.name, "Ep %d.mkv" % i)) for i in (1, 2, 3)]
+        out = subprocess.run([self.harness(), "playlist", SCRIPT, os.path.join(self.tmp.name, "clicks.json"), *files],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("ok previous file", out.stdout)
+
     def test_clicks(self):
         # Clicks the real menu items and checks the graph, and the position
         # after Back / Forward.
@@ -1421,28 +1462,35 @@ class Menu(unittest.TestCase):
         self.assertEqual(ao_inits(log), 3)
 
 
+def dualplay_copy(root):
+    """dualplay copied to root, where the fake helper is the compiled
+    tools/audio-pairs: the real one is out of its reach. Returns the helper's
+    calls and the environment to run it with."""
+    shutil.copy(DUALPLAY, root)
+    os.makedirs(os.path.join(root, "scripts"))
+    os.symlink(SCRIPT, os.path.join(root, "scripts", "dual_audio.lua"))
+    os.makedirs(os.path.join(root, "tools", ".build"))
+    _, calls = fake_helper(os.path.join(root, "tools", ".build"))
+    home = os.path.join(root, "mpv")  # MPV_HOME: keeps ~/.config/mpv out of it
+    os.makedirs(os.path.join(home, "scripts"))
+    # A menu "installed" there: dualplay neither builds nor loads it, and
+    # --no-config keeps mpv from loading it.
+    open(os.path.join(home, "scripts", "bubbatv.so"), "w").close()
+    return calls, dict(os.environ, MPV_HOME=home)
+
+
 class Dualplay(unittest.TestCase):
-    """dualplay -2, copied to a directory of its own where the fake helper
-    is the compiled tools/audio-pairs: the real one is out of its reach."""
+    """dualplay -2, copied to a directory of its own (dualplay_copy)."""
 
     def test_rebuilt_device_removed_on_exit(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = tmp.name
-        shutil.copy(DUALPLAY, root)
-        os.makedirs(os.path.join(root, "scripts"))
-        os.symlink(SCRIPT, os.path.join(root, "scripts", "dual_audio.lua"))
-        os.makedirs(os.path.join(root, "tools", ".build"))
-        _, calls = fake_helper(os.path.join(root, "tools", ".build"))
-        home = os.path.join(root, "mpv")  # MPV_HOME: keeps ~/.config/mpv out of it
-        os.makedirs(os.path.join(home, "scripts"))
-        # A menu "installed" there: dualplay neither builds nor loads it, and
-        # --no-config keeps mpv from loading it.
-        open(os.path.join(home, "scripts", "bubbatv.so"), "w").close()
+        calls, env = dualplay_copy(root)
         mpv = Mpv(root, "--pause", src=None,
                   cmd=[os.path.join(root, "dualplay"), "-2", TONES, "--no-config", "--vo=null",
                        "--really-quiet"],
-                  env=dict(os.environ, MPV_HOME=home))
+                  env=env)
         self.addCleanup(mpv.sock.close)
         self.addCleanup(mpv.quit)
         mpv.wait_for(lambda: [s.get("device") for s in (mpv.get("user-data/dual_audio") or {})
@@ -1453,6 +1501,70 @@ class Dualplay(unittest.TestCase):
         mpv.quit()
         self.assertEqual(calls(), ["create", "create|Pair A|Other Phones", "destroy"])
         self.assertEqual(mpv.proc.returncode, 0)
+
+
+class Folders(unittest.TestCase):
+    """dualplay with folders of episodes (a copy, see dualplay_copy): each
+    becomes its .mkv files in episode order, and mpv gets the whole playlist
+    up front."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "repo")
+        os.makedirs(self.root)
+        self.calls, self.env = dualplay_copy(self.root)
+        self.mpv = None
+
+    def tearDown(self):
+        if self.mpv:
+            self.mpv.quit()
+            self.mpv.sock.close()
+        self.tmp.cleanup()
+
+    def folder(self, name, *files):
+        """A folder with these files ("Extras/x.mkv" in a subfolder): .mkv
+        ones are short episodes, the others (and hidden ones) empty."""
+        path = os.path.join(self.tmp.name, name)
+        os.makedirs(path)
+        for f in files:
+            if f.lower().endswith(".mkv") and not os.path.basename(f).startswith("."):
+                episode(os.path.join(path, f))
+            else:
+                open(os.path.join(path, f), "w").close()
+        return path
+
+    def play(self, *args):
+        """dualplay ARGS... --pause; the playlist mpv got."""
+        self.mpv = Mpv(self.tmp.name, "--pause", src=None, env=self.env,
+                       cmd=[os.path.join(self.root, "dualplay"), *args, "--no-config", "--vo=null", "--really-quiet"])
+        return [e["filename"] for e in self.mpv.get("playlist")]
+
+    def test_folder(self):
+        # Any case of .mkv; not hidden files (macOS's "._" ones), others, or
+        # subfolders: in a season folder those hold extras and samples.
+        season = self.folder("Season 1", "Episode 10.mkv", "Episode 2.mkv", "episode 1.MKV", "._Episode 3.mkv",
+                             "Episode 2.srt", "notes.txt", "Extras/Making of.mkv", "Sample/sample.mkv")
+        self.assertEqual(self.play("-l", "ger", season + "/"),  # with the slash tab completion adds
+                         [os.path.join(season, n) for n in ("episode 1.MKV", "Episode 2.mkv", "Episode 10.mkv")])
+        self.assertTrue(self.mpv.get("pause"))  # mpv's options still go after it, dualplay's before
+        self.mpv.wait_for(lambda: (self.mpv.get("user-data/dual_audio") or {}).get("active"))
+        self.assertEqual(self.mpv.get("user-data/dual_audio")["sides"][0]["track"], 3)
+
+    def test_folders_and_files(self):
+        # Each folder's episodes take its place; the arguments keep their order.
+        s1, s2 = self.folder("S1", "E2.mkv", "E1.mkv"), self.folder("S2", "E10.mkv", "E9.mkv")
+        movie = episode(os.path.join(self.tmp.name, "movie.mkv"))
+        self.assertEqual(self.play(s2, movie, s1), [os.path.join(s2, "E9.mkv"), os.path.join(s2, "E10.mkv"), movie,
+                                                    os.path.join(s1, "E1.mkv"), os.path.join(s1, "E2.mkv")])
+
+    def test_no_mkv_files(self):
+        # A clear error before anything starts: with -2 not even the device.
+        show = self.folder("Show", "notes.txt", "._Episode 1.mkv", "Season 1/Episode 1.mkv")
+        out = subprocess.run([os.path.join(self.root, "dualplay"), "-2", show, "--no-config"],
+                             capture_output=True, text=True, timeout=60, env=self.env)
+        self.assertEqual((out.returncode, out.stderr),
+                         (1, "dualplay: no .mkv files in %s (its subfolders are not searched)\n" % show))
+        self.assertEqual(self.calls(), [])
 
 
 class App(unittest.TestCase):
@@ -1514,10 +1626,10 @@ class App(unittest.TestCase):
         self.assertTrue(os.access(os.path.join(self.app, "Contents", "MacOS", info["CFBundleExecutable"]), os.X_OK))
         self.assertEqual(info["BubbaTVDualplay"], os.path.join(ROOT, "dualplay"))
         self.assertEqual(info["BubbaTVPath"], self.path + ":/opt/homebrew/bin:/usr/local/bin")
-        # Offered for movies, never their default app.
+        # Offered for movies and folders of episodes, never their default app.
         types = info["CFBundleDocumentTypes"]
         self.assertEqual({t["LSHandlerRank"] for t in types}, {"Alternate"})
-        self.assertLessEqual({"public.movie", "org.matroska.mkv", "org.webmproject.webm"},
+        self.assertLessEqual({"public.movie", "org.matroska.mkv", "org.webmproject.webm", "public.folder"},
                              {u for t in types for u in t["LSItemContentTypes"]})
         self.assertEqual({t["UTTypeIdentifier"] for t in info["UTImportedTypeDeclarations"]},
                          {"org.matroska.mkv", "org.webmproject.webm"})
