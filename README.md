@@ -142,7 +142,9 @@ picture:
   delay (`Ctrl+-` / `Ctrl++`) moves both beeps.
 - With one shared pair, each ear beeps, and each ear's delay is set the same way.
 - mpv makes the pattern itself, so it needs no extra file. It has the
-  movie's size, so the window stays as it is. Subtitles are hidden meanwhile.
+  movie's size, but mpv closes its window and opens a new one as the pattern
+  starts ([below](#how-it-works)); Done keeps that one. Subtitles are hidden
+  meanwhile.
 - Picking a track, swapping, dual audio off and the next file end it too,
   the same way. Seeking moves the pattern along; Done still goes back to
   where you were.
@@ -217,7 +219,8 @@ speed by −/+10% and Backspace resets it.
 Rebind in `~/.config/mpv/input.conf`, e.g. `Ctrl+d script-binding dual_audio/toggle`
 (names: `toggle`, `cycle-left`, `cycle-right`, `swap`, `balance-left`, `balance-right`).
 Subtitles follow pairs has no key of its own: `Alt+j script-binding dual_audio/follow-subs`
-gives it one.
+gives it one, and `Alt+c script-binding dual_audio/calibrate` does for
+Calibrate delay… (again for Done).
 Lines there win over the plugin's keys, so `{ multiply speed 0.5` and
 `} multiply speed 2.0` bring the speed keys back.
 
@@ -256,7 +259,8 @@ devices_file=~~/dual_audio-devices.json
   channel (dialogue) keeps its full level, so a stereo and a 5.1 track sound
   about equally loud. If one is quieter, use `h` / `k`.
 - Video and seeking are untouched, and so are the subtitles unless they
-  follow the pairs: the graph only handles audio.
+  follow the pairs: the graph only handles audio (while calibrating, the
+  pattern's picture too).
 
 ## How it works
 
@@ -312,7 +316,10 @@ for the beep (on every channel) as `[ao]`, both on for 0.1 s at the same
 whole seconds, and `setpts` / `asetpts` moving them to where the movie was.
 The beep then goes through the same `@dual_audio` filter as the movie's
 sound, so its delays apply exactly as in the movie. Done installs the
-movie's graph again, selects the video track, and seeks back.
+movie's graph again, selects the video track, and seeks back. A `[vo]` in
+the graph makes mpv drop the video track playing, and with it (unless
+`--force-window` is on) its video output, so the window is opened anew for
+the pattern; going back to the video track keeps it.
 
 ## Tests
 

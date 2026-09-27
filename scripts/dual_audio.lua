@@ -544,7 +544,9 @@ end
 -- late as it hears the movie. The sources start at 0; setpts moves them to
 -- calib.from, the whole second (exact in both time bases) where calibrating
 -- started or a seek landed, so the position goes on from there. The picture
--- has the movie's size, so the window keeps its own.
+-- has the movie's size: mpv drops the video track for a [vo] in the graph,
+-- and without --force-window its window too, and opens the new one at the
+-- picture's size. (Back to the track, the window stays.)
 local function pattern()
     local on = "lt(mod(t,1),0.1)"
     return string.format("color=black:s=%dx%d:r=25,drawbox=c=white:t=fill:enable='%s',setpts=PTS+%d/TB[vo];"
