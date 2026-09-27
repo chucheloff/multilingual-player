@@ -68,7 +68,6 @@ local left, right       -- track ids for the current file (may be the same)
 local gain = { 0, 0 }   -- dB per side: left ear / first pair, then the other
 local delay = { 0, 0 }  -- ms per side; negative plays that side earlier
 local ours = false      -- lavfi-complex currently holds our graph
-local installed         -- the --af graph mpv holds for us, nil if none (see set_af)
 -- Languages to look for in the next file; follows manual track changes so a
 -- playlist of episodes keeps the same assignment.
 local pref = { left = opts.left_lang, right = opts.right_lang }
@@ -212,19 +211,27 @@ local function af_graph()
         table.concat(map, "|"), delays(), shift())
 end
 
+-- Our --af graph as mpv has it, nil if none. Looked up rather than kept:
+-- mpv saves the --af list in watch-later files and sets it again when it
+-- resumes, and the user can change the list too.
+local function installed()
+    for _, f in ipairs(mp.get_property_native("af", {})) do
+        if f.label == "dual_audio" then return f.params and f.params.graph end
+    end
+end
+
 -- Installs our --af filter in front of the user's own (they are left as
 -- they are), updates it, or takes it out. mpv replaces a filter whose
 -- string changes, losing the audio it holds, so this happens only when the
 -- sound breaks anyway: graph changes, seeks and a reopened audio output.
 local function set_af(want)
     local g = want and af_graph() or nil
-    if g == installed then return end
+    if g == installed() then return end
     if g then
         mp.commandv("af", "pre", "@dual_audio:lavfi=[" .. g .. "]")
     else
         mp.commandv("af", "remove", "@dual_audio")
     end
-    installed = g
 end
 
 -- Loudness and delay changes: sent to the running --af filter, so they are
@@ -401,7 +408,10 @@ end
 local function apply(live)
     local tracks = audio_tracks()
     local want = enabled and #tracks >= 2
-    if not want and not ours then return publish() end
+    if not want and not ours then
+        set_af(false)  -- there may be one from a watch-later file
+        return publish()
+    end
     if want and not (by_id(tracks, left) and by_id(tracks, right)) then pick(tracks) end
     local pos = live and mp.get_property_number("time-pos")
     -- Our --af filter goes in after the graph and out before it, so it only

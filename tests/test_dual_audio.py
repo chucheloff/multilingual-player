@@ -435,6 +435,27 @@ class Keys(Playing):
         self.af_has("delays=0|200,asetpts@dual_audio=PTS-0.2/TB")
         self.assertAlmostEqual(self.mpv.get("audio-delay"), 0.1)
 
+    def test_watch_later_and_our_filter(self):
+        # mpv saves the --af list in watch-later files too, our filter with
+        # it, and sets it again on resuming: with dual audio off, the plain
+        # track must play without our filter, and with it on, the filter
+        # must have the remembered values, not the saved ones.
+        later = os.path.join(self.tmp.name, "later")
+        self.restart("--watch-later-dir=" + later)
+        self.press("a", (1, 2))
+        self.mpv.command("keypress", "Q")  # quit-watch-later
+        self.mpv.proc.wait(timeout=10)
+        self.restart("--watch-later-dir=" + later)
+        self.assertEqual(self.mpv.get("af"), [])
+        self.press("a", (1, 2))
+        self.message("set-gain", 2, -6)  # live: the string keeps 0 dB
+        self.wait_sides([(0, 0), (-6, 0)])
+        self.mpv.command("keypress", "Q")
+        self.mpv.proc.wait(timeout=10)
+        self.restart("--watch-later-dir=" + later, "--script-opts-append=dual_audio-auto=yes")
+        self.expect((1, 2))
+        self.af_has("volume@dual_audio2=-6dB")
+
     def test_settings_remembered(self):
         # Loudness and delay are saved as they change, and are back for the
         # next file and the next launch. In ears mode each ear of the system
