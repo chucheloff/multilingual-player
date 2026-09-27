@@ -474,7 +474,8 @@ local function run_queue()
                 devices = { first or names[1], second or names[2] }
                 lost = {}
                 mp.commandv("ao-reload")
-                publish()
+                -- Other headphones bring their own loudness and delay.
+                if restore() and ours then apply(true) else publish() end
                 job.done()
             else
                 local why = (r and r.stderr or ""):gsub("^audio%-pairs: ", ""):gsub("%s+$", "")

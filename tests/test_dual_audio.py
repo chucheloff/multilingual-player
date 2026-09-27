@@ -529,6 +529,9 @@ class Devices(unittest.TestCase):
     def wait_logged(self, text):
         self.mpv.wait_for(lambda: text in read(self.log))
 
+    def graph_has(self, *parts):
+        self.mpv.wait_for(lambda: all(p in self.mpv.get("lavfi-complex") for p in parts))
+
     def wait_lost(self, lost):
         self.mpv.wait_for(lambda: [s.get("lost", False) for s in self.sides()] == lost)
 
@@ -559,6 +562,26 @@ class Devices(unittest.TestCase):
         self.wait_logged('could not switch the headphones | "Broken" matches 0 outputs')
         self.assertEqual(self.devices(), ["Nikita’s AirPods", "Friend, Pro"])
         self.assertEqual(ao_inits(self.log), 1)
+
+    def test_settings_follow_a_move(self):
+        # Loudness and delay stay with the headphones: after a swap they are
+        # on the other pair, and headphones new to a pair bring their own.
+        self.message("set-gain", 2, -6)
+        self.graph_has("volume=0dB[l]", "volume=-6dB[r]")
+        self.message("set-device", 1, "Friend, Pro")
+        self.mpv.wait_for(lambda: self.devices() == ["Friend, Pro", "Nikita’s AirPods"])
+        self.graph_has("volume=-6dB[l]", "volume=0dB[r]")
+        self.assertEqual([s["gain"] for s in self.sides()], [-6, 0])
+        self.message("set-delay", 2, 120)  # Nikita's
+        self.graph_has("adelay=120:all=1,volume=0dB[r]")
+        self.message("set-device", 2, "Other Phones")
+        self.mpv.wait_for(lambda: self.devices() == ["Friend, Pro", "Other Phones"])
+        self.graph_has("volume=-6dB[l]", "volume=0dB[r]")
+        self.assertNotIn("adelay", self.mpv.get("lavfi-complex"))
+        self.mpv.wait_for(lambda: abs(self.mpv.get("time-pos") - 3.0) < 0.05)
+        with open(os.path.join(self.tmp.name, "devices.json")) as f:
+            self.assertEqual(json.load(f), {"Friend, Pro": {"gain": -6, "delay": 0},
+                                            "Nikita’s AirPods": {"gain": 0, "delay": 120}})
 
     def test_dropout_and_back(self):
         self.mpv.command("set_property", "pause", False)

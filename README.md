@@ -72,6 +72,8 @@ outputs, or name them with `-p` (`./dualplay -L` lists the outputs), e.g.
 **Other headphones mid-movie:** each pair's **Device** in the bubbaTV menu
 lists the connected outputs; pick one and that pair plays there (pick the
 other pair's and the two swap). Switching takes a few seconds of silence.
+The headphones bring their own loudness and delay
+([remembered](#remembered-per-headphones)).
 
 **Headphones that drop out** (flat battery, out of range) pause the movie,
 and the screen says which pair it was. Reconnect them (Control Center →
@@ -138,10 +140,11 @@ file name.
 
 A pair's loudness and delay — from the menu, `h` / `k` or a script message —
 are saved for its headphones as soon as they change, and come back whenever
-those headphones play again: the next file, the next launch, and after `y` or
-with the pairs picked the other way round (`-p B -p A`). They stay with the
-headphones, not with the track or language. Pairs are told apart by name, so
-if both are called just "AirPods", rename one in its Bluetooth settings.
+those headphones play again: the next file, the next launch, and after `y`,
+with the pairs picked the other way round (`-p B -p A`) or when a pair moves
+to other headphones in the menu's **Device**. They stay with the headphones,
+not with the track or language. Pairs are told apart by name, so if both are
+called just "AirPods", rename one in its Bluetooth settings.
 
 With one shared pair, each ear keeps its own. The script can't see which
 device the Mac's sound output is (mpv only calls it "auto"), so the ears are
