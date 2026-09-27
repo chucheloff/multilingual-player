@@ -21,6 +21,7 @@ import analyze  # noqa: E402
 
 SCRIPT = os.path.join(ROOT, "scripts", "dual_audio.lua")
 MENU = os.path.join(ROOT, "tools", "bubbatv-menu.swift")
+DUALPLAY = os.path.join(ROOT, "dualplay")
 TONES = os.path.join(ROOT, "samples", "tones.mkv")  # 1=eng 440Hz, 2=rus 1000Hz 5.1, 3=ger 2500Hz
 BASE = ["mpv", "--no-config", "--script=" + SCRIPT, "--vo=null", "--really-quiet"]
 
@@ -30,6 +31,36 @@ def srt(path, word):
     with open(path, "w") as f:
         f.write("\n".join("%d\n00:00:%02d,000 --> 00:00:%02d,000\n%s %d\n" % (i + 1, i, i + 1, word, i)
                           for i in range(20)))
+
+
+def fake_helper(tmpdir):
+    """Stands in for tools/audio-pairs, which must not touch real devices here:
+    logs each call (arguments joined by "|") and, like the real one after a
+    moment, prints what `create` prints. Names with "Broken" in them fail.
+    Returns its path and a function giving the calls so far."""
+    path, log = os.path.join(tmpdir, "audio-pairs"), os.path.join(tmpdir, "audio-pairs.log")
+    with open(path, "w") as f:
+        f.write(f"""#!/bin/sh
+(IFS='|'; printf '%s\\n' "$*") >> '{log}'
+case "$*" in *Broken*) echo 'audio-pairs: "Broken" matches 0 outputs. Outputs:' >&2; exit 1 ;; esac
+[ "$1" != create ] || {{ sleep 0.2
+  printf 'com.multilingual-player.audio-pairs\\t%s\\t%s\\n' "${{2:-Pair A}}" "${{3:-Pair B}}"; }}
+""")
+    os.chmod(path, 0o755)
+    return path, lambda: read(log).splitlines()
+
+
+def read(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+def ao_inits(log):
+    """How often mpv opened its audio output, from its --log-file."""
+    return read(log).count("] AO: [")
 
 
 class Render(unittest.TestCase):
@@ -120,12 +151,16 @@ class Render(unittest.TestCase):
 
 
 class Mpv:
-    """A real-time mpv instance driven over its JSON IPC socket."""
+    """A real-time mpv instance driven over its JSON IPC socket. `cmd` can put
+    dualplay in front of it (with the file in `cmd` and src=None)."""
 
-    def __init__(self, tmpdir, *opts, src=TONES):
+    def __init__(self, tmpdir, *opts, src=TONES, cmd=BASE, env=None):
         self.path = os.path.join(tmpdir, "mpv.sock")
-        self.proc = subprocess.Popen(BASE + ["--ao=null", "--input-ipc-server=" + self.path,
-                                             *opts, src])
+        if os.path.exists(self.path):  # left by an mpv before
+            os.unlink(self.path)
+        self.proc = subprocess.Popen(cmd + ["--ao=null", "--input-ipc-server=" + self.path,
+                                            *opts, *([src] if src else [])],
+                                     env=env, stdout=subprocess.DEVNULL)
         deadline = time.time() + 10
         while not os.path.exists(self.path):
             if time.time() > deadline:
@@ -157,6 +192,14 @@ class Mpv:
                 return
             time.sleep(0.05)
         raise AssertionError("condition not met in time")
+
+    def quit(self):
+        """Quits over the socket: a signal would not stop dualplay while its mpv runs."""
+        try:
+            self.sock.sendall(b'{"command": ["quit"]}\n')
+        except OSError:
+            pass
+        self.proc.wait(timeout=10)
 
     def close(self):
         self.proc.terminate()
@@ -302,6 +345,85 @@ class Keys(Playing):
         self.mpv.command("set_property", "pause", False)
         time.sleep(3)
         self.assertLess(abs(self.mpv.get("avsync")), 0.1)
+
+
+class Devices(unittest.TestCase):
+    """dualplay -2's headphones: a pair moving to others (as the bubbaTV menu
+    asks) and dropping out mid-movie (as the menu reports). A fake helper
+    stands in for tools/audio-pairs; its calls are checked instead."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.helper, self.calls = fake_helper(self.tmp.name)
+        self.log = os.path.join(self.tmp.name, "mpv.log")
+        self.mpv = Mpv(self.tmp.name, "--start=3", "--pause", "--audio-channels=quad",
+                       "--log-file=" + self.log,
+                       "--script-opts-append=dual_audio-auto=yes",
+                       "--script-opts-append=dual_audio-mode=pairs",
+                       "--script-opts-append=dual_audio-pair_names=Nikita’s AirPods|Friend, Pro",
+                       "--script-opts-append=dual_audio-helper=" + self.helper)
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") is not None)
+
+    def tearDown(self):
+        self.mpv.close()
+        self.tmp.cleanup()
+
+    def message(self, *args):
+        self.mpv.command("script-message-to", "dual_audio", *map(str, args))
+
+    def sides(self):
+        return self.mpv.get("user-data/dual_audio")["sides"]
+
+    def devices(self):
+        return [s["device"] for s in self.sides()]
+
+    def wait_logged(self, text):
+        self.mpv.wait_for(lambda: text in read(self.log))
+
+    def wait_lost(self, lost):
+        self.mpv.wait_for(lambda: [s.get("lost", False) for s in self.sides()] == lost)
+
+    def test_move_a_pair(self):
+        self.message("set-device", 2, "Other Phones")
+        self.mpv.wait_for(lambda: self.devices() == ["Nikita’s AirPods", "Other Phones"])
+        self.assertEqual(self.calls(), ["create|Nikita’s AirPods|Other Phones"])
+        self.mpv.wait_for(lambda: ao_inits(self.log) == 2)  # ao-reload: on to the new device
+        self.wait_logged("Other Phones: [2] Russian 1000Hz 5.1 (rus)")
+        self.assertAlmostEqual(self.mpv.get("time-pos"), 3.0, delta=0.05)
+        # The other pair's headphones: the two pairs swap theirs.
+        self.message("set-device", 1, "Other Phones")
+        self.mpv.wait_for(lambda: self.devices() == ["Other Phones", "Nikita’s AirPods"])
+        self.assertEqual(self.calls()[-1], "create|Other Phones|Nikita’s AirPods")
+
+    def test_moves_wait_their_turn(self):
+        # The second, asked for while the helper still builds the first,
+        # starts from where the first leaves the pairs.
+        self.message("set-device", 1, "Other Phones")
+        self.message("set-device", 2, "Nikita’s AirPods")
+        self.mpv.wait_for(lambda: len(self.calls()) == 2)
+        self.assertEqual(self.calls(), ["create|Other Phones|Friend, Pro",
+                                        "create|Other Phones|Nikita’s AirPods"])
+        self.mpv.wait_for(lambda: self.devices() == ["Other Phones", "Nikita’s AirPods"])
+
+    def test_helper_fails(self):
+        self.message("set-device", 2, "Broken Phones")
+        self.wait_logged('could not switch the headphones | "Broken" matches 0 outputs')
+        self.assertEqual(self.devices(), ["Nikita’s AirPods", "Friend, Pro"])
+        self.assertEqual(ao_inits(self.log), 1)
+
+    def test_dropout_and_back(self):
+        self.mpv.command("set_property", "pause", False)
+        self.message("outputs", "Nikita’s AirPods", "MacBook Pro Speakers")
+        self.mpv.wait_for(lambda: self.mpv.get("pause"))
+        self.wait_logged("Pair 2 (Friend, Pro) dropped out, so the movie is paused.")
+        self.wait_lost([False, True])
+        self.assertEqual(self.calls(), [])
+        self.message("outputs", "Nikita’s AirPods", "Friend, Pro", "MacBook Pro Speakers")
+        self.mpv.wait_for(lambda: self.calls() == ["create|Nikita’s AirPods|Friend, Pro"])
+        self.wait_logged("Pair 2 (Friend, Pro) reconnected. | Press Space to resume.")
+        self.mpv.wait_for(lambda: ao_inits(self.log) == 2)
+        self.wait_lost([False, False])
+        self.assertTrue(self.mpv.get("pause"))  # resuming is up to the people watching
 
 
 class Subs(unittest.TestCase):
@@ -482,14 +604,35 @@ class Menu(unittest.TestCase):
                        check=True, timeout=300)
 
     @classmethod
+    def harness(cls):
+        # Built against libmpv: clicks the real menu items.
+        path = os.path.join(cls.build.name, "menu_clicks")
+        if not os.path.exists(path):
+            cls.swiftc("-o", path, "-L", os.path.join(cls.prefix, "lib"), "-lmpv",
+                       sources=[os.path.join(ROOT, "tests", "menu_clicks", "main.swift")])
+        return path
+
+    @classmethod
     def tearDownClass(cls):
         cls.build.cleanup()
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.start()
+
+    def start(self, *opts, env=None):
         self.mpv = Mpv(self.tmp.name, "--script=" + self.plugin, "--start=3", "--pause",
                        "--script-opts-append=dual_audio-mode=pairs",
-                       "--script-opts-append=dual_audio-pair_names=Nikita’s AirPods|Friend, Pro")
+                       "--script-opts-append=dual_audio-pair_names=Nikita’s AirPods|Friend, Pro",
+                       *opts, env=env)
+
+    def outputs(self, *names):
+        """The fake list of connected outputs the plugin reads (BUBBATV_DEVICES)."""
+        path = os.path.join(self.tmp.name, "outputs")
+        with open(path + ".new", "w", encoding="utf-8") as f:
+            f.write("\n".join(names) + "\n")
+        os.replace(path + ".new", path)  # never half a list
+        return path
 
     def tearDown(self):
         self.mpv.close()
@@ -527,12 +670,78 @@ class Menu(unittest.TestCase):
         self.wait_menu("Swap pairs\n[x] Subtitles follow pairs")
 
     def test_clicks(self):
-        # Built against libmpv: clicks the real menu items and checks the graph.
-        harness = os.path.join(self.build.name, "menu_clicks")
-        self.swiftc("-o", harness, "-L", os.path.join(self.prefix, "lib"), "-lmpv", sources=[os.path.join(ROOT, "tests", "menu_clicks", "main.swift")])
-        out = subprocess.run([harness, TONES, SCRIPT], capture_output=True, text=True, timeout=60)
+        # Clicks the real menu items and checks the graph.
+        out = subprocess.run([self.harness(), TONES, SCRIPT], capture_output=True, text=True, timeout=60)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("ok dual audio off", out.stdout)
+
+    def test_device_menu(self):
+        # Under dualplay -2 (the helper set) each pair's Device row lists the
+        # connected outputs and follows them as headphones come and go.
+        helper, calls = fake_helper(self.tmp.name)
+        outputs = self.outputs("Nikita’s AirPods", "Friend, Pro", "Other Phones")
+        self.mpv.close()
+        self.start("--script-opts-append=dual_audio-helper=" + helper,
+                   env=dict(os.environ, BUBBATV_DEVICES=outputs))
+        self.mpv.command("keypress", "a")
+        self.wait_menu("Pair 1\nDevice: Nikita’s AirPods\n  [x] Nikita’s AirPods\n  Friend, Pro\n"
+                       "  Other Phones\nAudio track:")
+        self.assertIn("Pair 2\nDevice: Friend, Pro\n  Nikita’s AirPods\n  [x] Friend, Pro\n"
+                      "  Other Phones\nAudio track:", self.menu())
+        self.mpv.command("set_property", "pause", False)
+        self.outputs("Nikita’s AirPods", "Other Phones")
+        self.wait_menu("Pair 2\nDevice: Friend, Pro — disconnected\n  Nikita’s AirPods\n  Other Phones\n")
+        self.mpv.wait_for(lambda: self.mpv.get("pause"))
+        self.outputs("Nikita’s AirPods", "Friend, Pro", "Other Phones")
+        self.mpv.wait_for(lambda: calls() == ["create|Nikita’s AirPods|Friend, Pro"])
+        self.wait_menu("Pair 2\nDevice: Friend, Pro\n  Nikita’s AirPods\n  [x] Friend, Pro\n")
+        self.assertTrue(self.mpv.get("pause"))
+
+    def test_device_clicks(self):
+        # Choosing headphones in the real menu: the helper rebuilds the
+        # combined device, and mpv reopens its audio output each time.
+        helper, calls = fake_helper(self.tmp.name)
+        outputs = self.outputs("Pair A", "Pair B", "Other Phones")
+        log = os.path.join(self.tmp.name, "clicks.log")
+        out = subprocess.run([self.harness(), TONES, SCRIPT, helper, log], capture_output=True,
+                             text=True, timeout=60, env=dict(os.environ, BUBBATV_DEVICES=outputs))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(calls(), ["create|Pair A|Other Phones", "create|Other Phones|Pair A"])
+        self.assertEqual(ao_inits(log), 3)
+
+
+class Dualplay(unittest.TestCase):
+    """dualplay -2, copied to a directory of its own where the fake helper
+    is the compiled tools/audio-pairs: the real one is out of its reach."""
+
+    def test_rebuilt_device_removed_on_exit(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = tmp.name
+        shutil.copy(DUALPLAY, root)
+        os.makedirs(os.path.join(root, "scripts"))
+        os.symlink(SCRIPT, os.path.join(root, "scripts", "dual_audio.lua"))
+        os.makedirs(os.path.join(root, "tools", ".build"))
+        _, calls = fake_helper(os.path.join(root, "tools", ".build"))
+        home = os.path.join(root, "mpv")  # MPV_HOME: keeps ~/.config/mpv out of it
+        os.makedirs(os.path.join(home, "scripts"))
+        # A menu "installed" there: dualplay neither builds nor loads it, and
+        # --no-config keeps mpv from loading it.
+        open(os.path.join(home, "scripts", "bubbatv.so"), "w").close()
+        mpv = Mpv(root, "--pause", src=None,
+                  cmd=[os.path.join(root, "dualplay"), "-2", TONES, "--no-config", "--vo=null",
+                       "--really-quiet"],
+                  env=dict(os.environ, MPV_HOME=home))
+        self.addCleanup(mpv.sock.close)
+        self.addCleanup(mpv.quit)
+        mpv.wait_for(lambda: [s.get("device") for s in (mpv.get("user-data/dual_audio") or {})
+                              .get("sides", [])] == ["Pair A", "Pair B"])
+        # dualplay gives the script the helper, to move a pair to other headphones.
+        mpv.command("script-message-to", "dual_audio", "set-device", "2", "Other Phones")
+        mpv.wait_for(lambda: calls() == ["create", "create|Pair A|Other Phones"])
+        mpv.quit()
+        self.assertEqual(calls(), ["create", "create|Pair A|Other Phones", "destroy"])
+        self.assertEqual(mpv.proc.returncode, 0)
 
 
 class App(unittest.TestCase):

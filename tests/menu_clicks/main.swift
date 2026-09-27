@@ -1,11 +1,16 @@
 // menu_clicks - click through the bubbaTV menu like a user, against a real
 // mpv (libmpv) running dual_audio.lua, and check what each click did.
 // Built together with tools/bubbatv-menu.swift (hence main.swift) and run by
-// tests/test_dual_audio.py (Menu.test_clicks):
+// tests/test_dual_audio.py (Menu.test_clicks, Menu.test_device_clicks):
 //   menu_clicks FILE DUAL_AUDIO_LUA     prints "ok ..." lines; exits 1 on a failure
+//   menu_clicks FILE DUAL_AUDIO_LUA HELPER LOG
+//       pairs mode as under dualplay -2 ("Pair A", "Pair B"), with HELPER in
+//       place of tools/audio-pairs: moves the pairs to other headphones.
+//       Outputs come from BUBBATV_DEVICES; mpv logs to LOG.
 import Cocoa
 
 let args = CommandLine.arguments
+let pairs = args.count == 5
 setvbuf(stdout, nil, _IOLBF, 0)
 _ = NSApplication.shared
 // Stands in for mpv's menu bar: the plugin goes before "Window".
@@ -14,8 +19,14 @@ bar.addItem(withTitle: "Window", action: nil, keyEquivalent: "")
 NSApp.mainMenu = bar
 
 let mpv = mpv_create()!
-for (k, v) in [("vo", "null"), ("ao", "null"), ("pause", "yes"), ("start", "3"),
-               ("scripts", args[2]), ("script-opts", "dual_audio-auto=yes")] {
+var options = [("vo", "null"), ("ao", "null"), ("pause", "yes"), ("start", "3"),
+               ("scripts", args[2]), ("script-opts", "dual_audio-auto=yes")]
+if pairs {
+    options += [("script-opts", "dual_audio-auto=yes,dual_audio-mode=pairs,"
+                 + "dual_audio-pair_names=Pair A|Pair B,dual_audio-helper=" + args[3]),
+                ("log-file", args[4])]
+}
+for (k, v) in options {
     mpv_set_option_string(mpv, k, v)
 }
 mpv_initialize(mpv)
@@ -50,6 +61,8 @@ func ui<T>(_ body: @MainActor () -> T) -> T {
 
 @MainActor func trackMenus() -> [NSMenuItem] { menu().items.filter { $0.title.hasPrefix("Audio track:") } }
 
+@MainActor func deviceMenus() -> [NSMenuItem] { menu().items.filter { $0.title.hasPrefix("Device:") } }
+
 func wait(_ what: String, _ ok: () -> Bool) {
     let end = Date() + 5
     while !ok() {
@@ -62,8 +75,27 @@ func wait(_ what: String, _ ok: () -> Bool) {
     print("ok \(what)")
 }
 
+// The helper's calls are for the test to check; here each move shows up in
+// the menu, and the audio output comes back after the ao-reload.
+func devices() {
+    wait("dual audio on") { ui { deviceMenus().compactMap(\.submenu).count } == 2 }
+    ui { click(deviceMenus()[1].submenu!, "Other Phones") }
+    wait("pair 2 moved") { ui { deviceMenus().map(\.title) } == ["Device: Pair A", "Device: Other Phones"] }
+    wait("audio output back") { get("current-ao") == "null" }
+    ui { click(deviceMenus()[0].submenu!, "Other Phones") }
+    wait("the other pair's headphones: the two swap") {
+        ui { deviceMenus().map(\.title) } == ["Device: Other Phones", "Device: Pair A"]
+    }
+    wait("audio output back again") { get("current-ao") == "null" }
+}
+
 Thread {
     wait("menu installed before Window") { ui { bar.items.map(\.title) } == ["bubbaTV", "Window"] }
+    if pairs {
+        devices()
+        mpv_terminate_destroy(mpv)
+        exit(0)
+    }
     wait("dual audio on") { graph().hasPrefix("[aid1]") && ui { menu().item(withTitle: "Swap ears") != nil } }
     ui { click(menu(), "Swap ears") }
     wait("swap") { graph().hasPrefix("[aid2]") }

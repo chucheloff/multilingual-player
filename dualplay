@@ -80,6 +80,8 @@ args+=(--script-opts-append=dual_audio-auto=yes)
 # of the movie.
 build_helper
 info=$("$helper" create ${names[@]+"${names[@]}"})
+# The script rebuilds the device with the same UID when a pair moves to other
+# headphones or gets them back, so this removes whichever is there last.
 trap '"$helper" destroy' EXIT
 trap 'exit 130' INT TERM  # make sure Ctrl+C still runs the EXIT trap
 IFS=$'\t' read -r uid first second <<<"$info"
@@ -87,5 +89,6 @@ echo "dualplay: first track -> $first, second track -> $second"
 
 args+=(--audio-device="coreaudio/$uid" --audio-channels=quad
        --script-opts-append=dual_audio-mode=pairs
-       --script-opts-append="dual_audio-pair_names=$first|$second")
+       --script-opts-append="dual_audio-pair_names=$first|$second"
+       --script-opts-append="dual_audio-helper=$helper")
 mpv "${args[@]}" "$@"

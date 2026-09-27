@@ -24,6 +24,11 @@
 -- which has no key of its own): the first side's language as the main
 -- subtitles, the other side's as mpv's secondary ones (at the top).
 --
+-- Under dualplay -2 (the helper option set), `set-device SIDE NAME` moves a
+-- pair to other headphones, and the menu reports the connected outputs with
+-- `outputs NAME...`: headphones that drop out pause the movie, and once they
+-- are back the combined device is built again.
+--
 -- Options below are set in script-opts/dual_audio.conf or with
 -- --script-opts=dual_audio-KEY=VALUE.
 
@@ -36,6 +41,7 @@ local opts = {
     left_lang = "",     -- preferred languages for the left ear / first pair, e.g. "eng,en"
     right_lang = "",    -- preferred languages for the right ear / second pair, e.g. "rus,ru"
     pair_names = "",    -- "first|second": device names shown on the OSD in pairs mode
+    helper = "",        -- pairs mode: tools/audio-pairs, to rebuild the combined device (dualplay sets it)
     balance_step = 2,   -- dB per balance keypress
     follow_subs = false, -- subtitles in both sides' languages (see update_subs)
 }
@@ -46,6 +52,12 @@ local side_names = pairs_mode and { "Pair 1", "Pair 2" } or { "Left ear", "Right
 local sides_word = pairs_mode and "pairs" or "ears"
 local devices = {}      -- pairs mode: each pair's device, from pair_names
 for name in opts.pair_names:gmatch("[^|]+") do devices[#devices + 1] = name end
+local lost = {}         -- pairs mode: side -> true while its headphones are gone
+local queue = {}        -- pairs mode: device changes for the helper, the running one first
+
+-- The pairs play on one device combining both headphones (dualplay -2), so
+-- the helper that built it can build it again from other headphones.
+local function can_combine() return pairs_mode and opts.helper ~= "" and #devices == 2 end
 
 local enabled = opts.auto
 local left, right       -- track ids for the current file (may be the same)
@@ -178,11 +190,11 @@ local function publish()
     local sides = {}
     for i, id in ipairs({ left or false, right or false }) do
         sides[i] = { name = side_names[i], device = devices[i] or (out ~= "auto" and out or nil),
-                     track = id or nil, gain = gain[i], delay = delay[i] }
+                     lost = lost[i], track = id or nil, gain = gain[i], delay = delay[i] }
     end
     mp.set_property_native("user-data/dual_audio", {
         enabled = enabled, active = ours, mode = opts.mode, tracks = list, sides = sides,
-        follow_subs = follow,
+        follow_subs = follow, switch_devices = can_combine(),
     })
 end
 
@@ -280,6 +292,12 @@ local function tweaks(i)
     return s
 end
 
+-- On the OSD, and on one line in the log.
+local function say(text, secs)
+    msg.info((text:gsub("\n", " | ")))
+    mp.osd_message(text, secs)
+end
+
 local function show()
     local tracks = audio_tracks()
     local text
@@ -292,8 +310,7 @@ local function show()
             devices[1] or side_names[1], label(tracks, left), tweaks(1),
             devices[2] or side_names[2], label(tracks, right), tweaks(2))
     end
-    msg.info((text:gsub("\n", " | ")))
-    mp.osd_message(text, 4)
+    say(text, 4)
 end
 
 local function toggle()
@@ -366,6 +383,86 @@ for name, set in pairs(setters) do
         end
     end)
 end
+
+-- Builds the combined device again (first pair's output, second pair's) and
+-- reopens mpv's audio output on it: it keeps its UID, so --audio-device
+-- still names it and dualplay's exit trap still removes it. The helper takes
+-- a few seconds, so changes asked for meanwhile wait their turn; `want`
+-- gives the two outputs once it is theirs.
+local function run_queue()
+    local job = queue[1]
+    if not job then return end
+    local names = job.want()
+    mp.command_native_async({ name = "subprocess", args = { opts.helper, "create", names[1], names[2] },
+                              capture_stdout = true, capture_stderr = true, playback_only = false },
+        function(_, r)
+            table.remove(queue, 1)
+            if r and r.status == 0 then
+                -- It prints UID<TAB>first<TAB>second, with the devices' full names.
+                local first, second = r.stdout:match("^[^\t]*\t([^\t]*)\t([^\t\n]*)")
+                devices = { first or names[1], second or names[2] }
+                lost = {}
+                mp.commandv("ao-reload")
+                publish()
+                job.done()
+            else
+                local why = (r and r.stderr or ""):gsub("^audio%-pairs: ", ""):gsub("%s+$", "")
+                say("Dual audio: could not switch the headphones\n"
+                    .. (why ~= "" and why or "the helper did not run"), 8)
+            end
+            run_queue()
+        end)
+end
+
+local function combine(want, done)
+    queue[#queue + 1] = { want = want, done = done }
+    if #queue == 1 then run_queue() end
+end
+
+local function pair(i) return string.format("%s (%s)", side_names[i], devices[i]) end
+
+-- set-device SIDE NAME, from the bubbaTV menu: that pair moves to other
+-- headphones (to the other pair's, and the two swap).
+mp.register_script_message("set-device", function(side, name)
+    local i = tonumber(side)
+    if not (can_combine() and (i == 1 or i == 2) and name) then return end
+    combine(function()
+        local names = { devices[1], devices[2] }
+        if names[3 - i] == name then names[3 - i] = names[i] end
+        names[i] = name
+        return names
+    end, show)
+end)
+
+-- outputs NAME..., from the bubbaTV menu whenever the connected outputs
+-- change. Headphones that drop out pause the movie; once every pair's are
+-- back, the combined device (which lost them) is built again - the movie
+-- stays paused for the people to get ready.
+mp.register_script_message("outputs", function(...)
+    if not can_combine() then return end
+    local connected, gone, back, missing = {}, {}, {}, false
+    for _, name in ipairs({ ... }) do connected[name] = true end
+    for i = 1, 2 do
+        if not connected[devices[i]] then
+            missing = true
+            if not lost[i] then gone[#gone + 1] = pair(i) end
+            lost[i] = true
+        elseif lost[i] then
+            back[#back + 1] = pair(i)
+        end
+    end
+    if #gone > 0 then
+        publish()
+        mp.set_property_bool("pause", true)
+        say(table.concat(gone, " and ") .. " dropped out, so the movie is paused.\n"
+            .. "Reconnect the headphones to go on.", 10)
+    elseif #back > 0 and not missing then
+        combine(function() return devices end, function()
+            say(table.concat(back, " and ") .. " reconnected."
+                .. (mp.get_property_bool("pause") and "\nPress Space to resume." or ""), 10)
+        end)
+    end
+end)
 
 mp.register_event("start-file", function() loading = true end)
 

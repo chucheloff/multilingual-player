@@ -7,8 +7,8 @@ Watch a movie with a friend in two languages at once, on one Mac:
 
 It's a plugin for [mpv](https://mpv.io) (`scripts/dual_audio.lua`) plus a
 small launcher (`dualplay`), with a **bubbaTV** menu in mpv's menu bar for
-each pair's track, loudness and delay, and subtitles in both languages. The
-**bubbaTV** app starts a movie without the terminal.
+each pair's headphones, track, loudness and delay, and subtitles in both
+languages. The **bubbaTV** app starts a movie without the terminal.
 
 ## Quick start
 
@@ -68,6 +68,16 @@ Other headphones or speakers work too: `-2` picks the two connected Bluetooth
 outputs, or name them with `-p` (`./dualplay -L` lists the outputs), e.g.
 `./dualplay -2 -p "Nikita" -p "MacBook Pro Speakers" movie.mkv`.
 
+**Other headphones mid-movie:** each pair's **Device** in the bubbaTV menu
+lists the connected outputs; pick one and that pair plays there (pick the
+other pair's and the two swap). Switching takes a few seconds of silence.
+
+**Headphones that drop out** (flat battery, out of range) pause the movie,
+and the screen says which pair it was. Reconnect them (Control Center →
+Bluetooth); once they're back the sound is set up again and the screen says
+to press Space. If that fails, the screen says why: pick the headphones in
+**Device** again to retry.
+
 Volume: `9` / `0` changes both, `h` / `k` makes one pair quieter than the other,
 and the bubbaTV menu sets each pair's loudness on its own.
 If speech lags the picture, `Ctrl+-` plays the audio 100 ms earlier (`Ctrl++` later);
@@ -79,7 +89,8 @@ in the bubbaTV menu. `samples/sync.mkv` flashes and beeps once a second to check
 `dualplay` adds a **bubbaTV** menu to mpv's menu bar (next to Playback). With
 dual audio on it has a group per pair (or ear):
 
-- **Device** — the headphones (or output) that pair plays on
+- **Device** — the headphones (or output) that pair plays on; with `-2`, pick
+  other connected headphones here (marked "disconnected" while they're gone)
 - **Audio track** — the track it plays; pick any, the other pair's too
 - **Loudness** — −30 … +6 dB, on top of mpv's volume
 - **Delay** — −1000 … +1000 ms, on top of mpv's audio delay (`Ctrl+-` / `Ctrl++`)
@@ -94,7 +105,9 @@ compiles it on first run with `swiftc` (`xcode-select --install`) against the
 installed mpv; without `swiftc`, mpv plays as before, just without the menu.
 The script takes the same settings from anywhere:
 `script-message-to dual_audio set-track|set-gain|set-delay SIDE VALUE`
-(SIDE 1 = left ear / first pair, 2 = the other; dB, ms).
+(SIDE 1 = left ear / first pair, 2 = the other; dB, ms), and with `-2`
+`set-device SIDE NAME` (the output's full name, as the menu lists it). The menu
+reports the connected outputs to the script with `outputs NAME...`.
 
 ## Subtitles in both languages
 
@@ -191,6 +204,11 @@ into one CoreAudio *aggregate device*: channels 1–2 go to the first pair, 3–
 to the second. The second pair follows the first one's clock (drift
 correction). The device exists only while `dualplay` runs.
 
+A device like that can't swap one of its headphones, so moving a pair (or
+getting back one that dropped out) has the helper build it again with the
+same ID, and mpv reopens its audio output on it (`ao-reload`). The menu
+watches CoreAudio's device list to notice headphones coming and going.
+
 The helper also labels the four channels L, R, Ls, Rs. By default macOS labels
 them all "unknown". mpv then treats the device as stereo and folds channels 3–4
 into 1–2, so both pairs would hear both languages. With the labels, mpv sees a
@@ -218,6 +236,9 @@ and which subtitle lines show for which pair.
 With `swiftc` they also build the bubbaTV menu, load it into mpv and click
 through it (`tests/menu_clicks/`). They build bubbaTV.app too and check the
 command its `--dry-run` prints.
+They never create or remove audio devices: headphones coming and going are a
+fake list of outputs (`BUBBATV_DEVICES=FILE`, read by the menu instead of
+CoreAudio), and a fake `audio-pairs` logs what it's asked to do.
 For listening: `samples/speech.mkv` (English and Russian speech) and
 `samples/sync.mkv` (flash + beep).
 
