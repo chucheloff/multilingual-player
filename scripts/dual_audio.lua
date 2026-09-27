@@ -14,6 +14,7 @@
 --   a  toggle          y  swap
 --   {  cycle-left      }  cycle-right   (Shift+[ / Shift+]; replace mpv's speed halve/double)
 --   h  balance-left    k  balance-right
+--   Left / Right  seek-back / seek-forward: exactly seek_step seconds (see seek)
 --
 -- Both sides may play the same track. Each side also has its own loudness
 -- and delay, set from the bubbaTV menu (tools/bubbatv-menu.swift) or with
@@ -53,6 +54,8 @@ local opts = {
     balance_step = 2,   -- dB per balance keypress
     follow_subs = false, -- subtitles in both sides' languages (see update_subs)
     devices_file = "~~/dual_audio-devices.json",  -- remembered loudness and delay; "" for none
+    seek_step = 5,      -- seconds that Left / Right and the menu's Back / Forward move
+    seek_keys = true,   -- Left / Right seek exactly; no: mpv's own (keyframe) seeks stay on them
 }
 options.read_options(opts, "dual_audio")
 local pairs_mode = opts.mode == "pairs"
@@ -83,12 +86,13 @@ local subs_set          -- the subtitle ids we selected while following, by slot
 local loading = true    -- a file is loading: mpv picks its own subtitles until on_preloaded
 local calib             -- while calibrating: where the pattern starts and what to put back (see calibrate)
 
+-- The tracks of one kind, and how many there are of any kind.
 local function tracks_of(kind)
-    local list = {}
-    for _, t in ipairs(mp.get_property_native("track-list", {})) do
+    local all, list = mp.get_property_native("track-list", {}), {}
+    for _, t in ipairs(all) do
         if t.type == kind then list[#list + 1] = t end
     end
-    return list
+    return list, #all
 end
 
 local function audio_tracks() return tracks_of("audio") end
@@ -336,8 +340,11 @@ end
 
 -- The state as the bubbaTV menu shows it. `device` is left out when mpv
 -- plays to the system default output; the menu looks that one up.
+-- `file_loaded`: a file is open, paused or not (it has tracks), for the
+-- menu's Back / Forward.
 local function publish()
-    local tracks, list = audio_tracks(), {}
+    local tracks, any = audio_tracks()
+    local list = {}
     for _, t in ipairs(tracks) do list[#list + 1] = { id = t.id, title = label(tracks, t.id) } end
     local sides = {}
     for i, id in ipairs({ left or false, right or false }) do
@@ -347,6 +354,7 @@ local function publish()
     mp.set_property_native("user-data/dual_audio", {
         enabled = enabled, active = ours, mode = opts.mode, tracks = list, sides = sides,
         follow_subs = follow, switch_devices = can_combine(), calibrating = calib ~= nil,
+        file_loaded = any > 0, seek_step = opts.seek_step,
     })
 end
 
@@ -595,6 +603,13 @@ local function follow_seek()
     end
 end
 
+-- Left / Right and the menu's Back / Forward, to hear a line again: mpv's
+-- own arrow seeks land on a keyframe instead, which can be seconds off
+-- (relative seeks aren't exact by default). The OSD shows where it landed.
+local function seek(dir)
+    mp.commandv("osd-msg-bar", "seek", dir * opts.seek_step, "relative+exact")
+end
+
 -- set-track / set-gain / set-delay SIDE VALUE, from the bubbaTV menu.
 local setters = {
     ["set-track"] = function(i, id)
@@ -713,8 +728,8 @@ mp.register_event("file-loaded", function()
     if ours then show() end
 end)
 
--- Tracks come and go (next file, --audio-file), and so does the output -
--- which in ears mode brings its own saved settings.
+-- Tracks come and go (next file, --audio-file, no file), and so does the
+-- output - which in ears mode brings its own saved settings.
 mp.observe_property("track-list", nil, publish)
 mp.observe_property("audio-device", nil, function()
     if restore() then tune() else publish() end
@@ -754,3 +769,7 @@ mp.add_key_binding("h", "balance-left", function() nudge(1) end)
 mp.add_key_binding("k", "balance-right", function() nudge(2) end)
 mp.add_key_binding(nil, "follow-subs", toggle_follow)
 mp.add_key_binding(nil, "calibrate", calibrate)
+-- Held down, they go on seeking. input.conf lines for Left / Right win over
+-- these, as for the other keys.
+mp.add_key_binding(opts.seek_keys and "LEFT" or nil, "seek-back", function() seek(-1) end, { repeatable = true })
+mp.add_key_binding(opts.seek_keys and "RIGHT" or nil, "seek-forward", function() seek(1) end, { repeatable = true })

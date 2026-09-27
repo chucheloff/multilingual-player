@@ -9,7 +9,8 @@ It's a plugin for [mpv](https://mpv.io) (`scripts/dual_audio.lua`) plus a
 small launcher (`dualplay`), with a **bubbaTV** menu in mpv's menu bar for
 each pair's headphones, track, loudness and delay, and subtitles in both
 languages. Loudness and delay are remembered per headphones, and a sync
-pattern helps set the delays. The **bubbaTV** app starts a movie without the
+pattern helps set the delays. `←` / `→` go back and forth exactly 5 seconds,
+to hear a line again. The **bubbaTV** app starts a movie without the
 terminal.
 
 ## Quick start
@@ -111,6 +112,10 @@ when the earlier pair's delay changes, the picture runs a little slower or
 faster for a couple of seconds to catch up. Click a value to reset it to 0.
 Picking a track still restarts the sound for a moment.
 
+Last comes **Playback**, whenever a movie is open (with dual audio off
+too): **Back 5 s** and **Forward 5 s** go exactly that far, like `←` / `→`
+([Keys](#keys)), and the screen shows where playback is now.
+
 The menu is a native mpv plugin (`tools/bubbatv-menu.swift`). `dualplay`
 compiles it on first run with `swiftc` (`xcode-select --install`) against the
 installed mpv; without `swiftc`, mpv plays as before, just without the menu.
@@ -211,18 +216,39 @@ they last only until mpv quits.
 | `}` (Shift+`]`) | next track for the **right** ear / second pair |
 | `y` | swap |
 | `h` / `k` | balance: make the left ear / first pair louder, or the other side (2 dB steps) |
+| `←` / `→` | back / forward exactly 5 s, to hear a line again (hold to keep going) |
 
 Shift is required so a stray keypress can't switch the language mid-movie.
 `{` / `}` take over mpv's halve / double speed keys; `[` / `]` still change the
 speed by −/+10% and Backspace resets it.
 
+`←` / `→` replace mpv's own 5 s seeks there, which jump to the nearest
+*keyframe* (a point the video can restart from): in a movie that can be
+several seconds off, too far back or past the line. Exact seeks land on the
+spot; with a long gap between keyframes they may take a moment. The screen
+shows the new position. `seek_step` (options below) changes the 5 s, for
+the menu's Back / Forward too; `seek_keys=no` leaves mpv's own `←` / `→`
+(the menu still seeks exactly). `Shift+←` / `Shift+→` stay mpv's exact 1 s
+steps.
+
 Rebind in `~/.config/mpv/input.conf`, e.g. `Ctrl+d script-binding dual_audio/toggle`
-(names: `toggle`, `cycle-left`, `cycle-right`, `swap`, `balance-left`, `balance-right`).
+(names: `toggle`, `cycle-left`, `cycle-right`, `swap`, `balance-left`, `balance-right`,
+`seek-back`, `seek-forward`).
 Subtitles follow pairs has no key of its own: `Alt+j script-binding dual_audio/follow-subs`
 gives it one, and `Alt+c script-binding dual_audio/calibrate` does for
 Calibrate delay… (again for Done).
 Lines there win over the plugin's keys, so `{ multiply speed 0.5` and
-`} multiply speed 2.0` bring the speed keys back.
+`} multiply speed 2.0` bring the speed keys back, and `RIGHT seek 5` mpv's `→`.
+
+What else moves playback, as mpv has it:
+
+- **Chapters** (a movie's "parts", often 10–20 minutes): the two skip
+  buttons right after play/pause in the on-screen controls, `PgUp` / `PgDn`,
+  and Playback → Next / Previous Chapter in the menu bar.
+- **Media keys** (previous / next track, `F7` / `F9`; a double / triple press on
+  AirPods): the next / previous file in the playlist; nothing with a single movie.
+- `↑` / `↓`: a minute, to a keyframe. `Shift+↑` / `Shift+↓`: exactly 5 s,
+  without showing it on screen. Clicking the progress bar: exactly there.
 
 ## Install as a plugin
 
@@ -243,6 +269,9 @@ auto=yes
 left_lang=eng,en
 right_lang=rus,ru
 balance_step=2
+# seconds for ←/→ and the menu's Back/Forward; seek_keys=no keeps mpv's own ←/→
+seek_step=5
+seek_keys=yes
 # subtitles in both pairs' languages
 follow_subs=yes
 # where each headphones' loudness and delay are remembered (~~ = mpv's config dir)
@@ -258,9 +287,9 @@ devices_file=~~/dual_audio-devices.json
 - **With one shared pair, each ear gets a mono downmix** of its track. For 5.1 tracks the centre
   channel (dialogue) keeps its full level, so a stereo and a 5.1 track sound
   about equally loud. If one is quieter, use `h` / `k`.
-- Video and seeking are untouched, and so are the subtitles unless they
-  follow the pairs: the graph only handles audio (while calibrating, the
-  pattern's picture too).
+- Video is untouched, and so are the subtitles unless they follow the
+  pairs: the graph only handles audio (while calibrating, the pattern's
+  picture too). Seeking works as usual, `←` / `→` aside ([Keys](#keys)).
 
 ## How it works
 
@@ -330,7 +359,8 @@ python3 tests/test_dual_audio.py
 Generates `samples/` (via `tools/make-samples.sh`): `tones.mkv` has a
 distinct sine tone per track, and the tests play it through mpv and check which
 tone lands in which channel, including key presses sent over mpv's IPC socket,
-and which subtitle lines show for which pair. `sync.mkv` beeps once a second
+and which subtitle lines show for which pair. Its keyframes are 10 s apart,
+so a seek that lands 5 s away was exact. `sync.mkv` beeps once a second
 on both tracks: the tests check when each ear's beeps arrive, change a delay
 or loudness during playback and measure when and how loud each channel's
 beeps come out, and that nothing seeks. They also calibrate, measuring
