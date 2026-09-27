@@ -11,7 +11,7 @@
 --
 -- Keys (rebind in input.conf with `KEY script-binding dual_audio/<name>`):
 --   a  toggle          y  swap
---   (  cycle-left      )  cycle-right
+--   [  cycle-left      ]  cycle-right   (replace mpv's speed -/+10% keys)
 --   h  balance-left    k  balance-right
 --
 -- Options below are set in script-opts/dual_audio.conf or with
@@ -247,8 +247,8 @@ if pairs_mode then
 end
 
 mp.add_key_binding("a", "toggle", toggle)
-mp.add_key_binding("(", "cycle-left", function() cycle("left") end)
-mp.add_key_binding(")", "cycle-right", function() cycle("right") end)
+mp.add_key_binding("[", "cycle-left", function() cycle("left") end)
+mp.add_key_binding("]", "cycle-right", function() cycle("right") end)
 mp.add_key_binding("y", "swap", swap)
 mp.add_key_binding("h", "balance-left", function() nudge(-opts.balance_step) end)
 mp.add_key_binding("k", "balance-right", function() nudge(opts.balance_step) end)
