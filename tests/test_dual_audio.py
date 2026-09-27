@@ -172,14 +172,23 @@ class Playing(unittest.TestCase):
         self.expect(expect)
 
     def expect(self, expect):
-        """Wait until the graph routes aid L / aid R (None = off) at 3.0s."""
+        """Wait until the graph routes aid L / aid R (None = off) at 3.0s, and
+        the script has published it: the last thing it does for a change, so
+        the subtitles are set by then too."""
         def routed():
             g = self.mpv.get("lavfi-complex")
             if expect is None:
                 return g == ""
             ids = [int(i) for i in re.findall(r"\[aid(\d+)\]", g)]
             return (ids * 2)[:2] == list(expect)  # a track both sides play appears once
+
+        def published():
+            s = self.state()
+            if expect is None:
+                return not s["active"]
+            return s["active"] and [side.get("track") for side in s["sides"]] == list(expect)
         self.mpv.wait_for(routed)
+        self.mpv.wait_for(published)
         self.mpv.wait_for(lambda: abs((self.mpv.get("time-pos") or 0) - 3.0) < 0.05)
 
     def next_file(self):
@@ -414,7 +423,7 @@ class FollowSubs(Playing):
         self.mpv.command("keypress", "Alt+v")
         self.press("}", (1, 3))
         self.assertEqual(self.ids(), [3, False])
-        self.mpv.command("keypress", "j")      # mpv's next subtitle track is
+        self.mpv.command("keypress", "j")      # mpv's next subtitle track: a pick
         self.mpv.wait_for(lambda: not self.state()["follow_subs"])
         picked = self.ids()
         self.press("{", (2, 3))
