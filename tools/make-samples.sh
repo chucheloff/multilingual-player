@@ -13,6 +13,8 @@ DUR=20
 
 # Track 1: 440 Hz stereo AAC (eng). Track 2: 1000 Hz 5.1 AC3 (rus) - movies often
 # ship 5.1, so this exercises the downmix. Track 3: 2500 Hz stereo AAC (ger).
+# A keyframe every 10 s (-g 250): the tests tell an exact seek from one that
+# lands on a keyframe.
 ffmpeg -loglevel error -y \
   -f lavfi -i "testsrc2=size=640x360:rate=25:duration=$DUR" \
   -f lavfi -i "sine=frequency=440:duration=$DUR" \
@@ -20,7 +22,7 @@ ffmpeg -loglevel error -y \
   -f lavfi -i "sine=frequency=2500:duration=$DUR" \
   -filter_complex "[1]aformat=channel_layouts=stereo[a1];[2]aformat=channel_layouts=5.1[a2];[3]aformat=channel_layouts=stereo[a3]" \
   -map 0:v -map "[a1]" -map "[a2]" -map "[a3]" \
-  -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+  -c:v libx264 -preset ultrafast -pix_fmt yuv420p -g 250 \
   -c:a:0 aac -c:a:1 ac3 -c:a:2 aac \
   -metadata:s:a:0 language=eng -metadata:s:a:0 title="English 440Hz" \
   -metadata:s:a:1 language=rus -metadata:s:a:1 title="Russian 1000Hz 5.1" \

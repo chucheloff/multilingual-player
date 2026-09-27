@@ -1,7 +1,8 @@
 // bubbatv - the "bubbaTV" menu in mpv's menu bar, for scripts/dual_audio.lua:
 // for each headphone pair (or ear) its device, audio track, loudness and delay,
 // whether the subtitles follow the pairs' languages, and a sync pattern to set
-// the delays by.
+// the delays by; then Playback, with exact short seeks back and forth to hear
+// a line again.
 //
 // An mpv C plugin: a library mpv loads with --script=bubbatv.so. dualplay
 // builds and loads it; by hand:
@@ -11,7 +12,7 @@
 //
 // It shows the state dual_audio.lua keeps in user-data/dual_audio and changes
 // it with `script-message-to dual_audio set-track|set-gain|set-delay SIDE VALUE`
-// and the script's key bindings.
+// and the script's key bindings (seek-back / seek-forward for Playback too).
 // Under dualplay -2 it also lists the connected outputs to move a pair to
 // (set-device) and tells the script when they change (outputs NAME...).
 // The menu as built is mirrored as text in user-data/bubbatv/menu (for tests).
@@ -37,6 +38,8 @@ struct State: Sendable {
     var loaded = false, enabled = false, active = false, pairs = false, followSubs = false
     var calibrating = false    // the sync pattern plays instead of the movie
     var switchDevices = false  // dualplay -2: a pair can move to other headphones
+    var fileLoaded = false     // a file plays (or is paused): Playback applies
+    var seekStep = 5.0         // seconds Back / Forward move
     var tracks: [Track] = []
     var sides: [Side] = []
 
@@ -52,6 +55,8 @@ struct State: Sendable {
         followSubs = o["follow_subs"] as? Bool ?? false
         switchDevices = o["switch_devices"] as? Bool ?? false
         calibrating = o["calibrating"] as? Bool ?? false
+        fileLoaded = o["file_loaded"] as? Bool ?? false
+        seekStep = o["seek_step"] as? Double ?? 5
         tracks = (o["tracks"] as? [[String: Any]] ?? []).compactMap { t in
             guard let id = t["id"] as? Int else { return nil }
             return Track(id: id, title: t["title"] as? String ?? "[\(id)]")
@@ -322,7 +327,19 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
             subs.state = state.followSubs ? .on : .off
             menu.addItem(subs)
         }
+        playback()
         mirror()
+    }
+
+    /// Whenever a file is loaded, dual audio on or off: Back / Forward seek
+    /// exactly, as Left / Right do.
+    private func playback() {
+        guard state.fileLoaded else { return }
+        menu.addItem(.separator())
+        menu.addItem(header("Playback"))
+        let step = String(format: "%g", state.seekStep)
+        menu.addItem(item("Back \(step) s", #selector(back)))
+        menu.addItem(item("Forward \(step) s", #selector(forward)))
     }
 
     /// "Device: Nikita’s AirPods" - under dualplay -2 with the connected
@@ -396,6 +413,9 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
         guard let v = sender.representedObject as? [String] else { return }
         mpv.command(["script-message-to", "dual_audio", "set-device"] + v)
     }
+
+    @objc private func back() { mpv.command("script-binding", "dual_audio/seek-back") }
+    @objc private func forward() { mpv.command("script-binding", "dual_audio/seek-forward") }
 
     /// The menu as text, one item per line: "[x]" marks checked items,
     /// submenus are indented.
