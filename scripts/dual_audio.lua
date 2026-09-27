@@ -215,7 +215,7 @@ end
 -- Installs our --af filter in front of the user's own (they are left as
 -- they are), updates it, or takes it out. mpv replaces a filter whose
 -- string changes, losing the audio it holds, so this happens only when the
--- sound breaks anyway: graph changes and seeks.
+-- sound breaks anyway: graph changes, seeks and a reopened audio output.
 local function set_af(want)
     local g = want and af_graph() or nil
     if g == installed then return end
@@ -231,7 +231,7 @@ end
 -- heard at once, with no graph rebuild and no seek. A new shift moves the
 -- sound against the picture, which then slows down or speeds up for a
 -- moment to catch up. The filter's string still has the old values; it
--- catches up at the next seek (see the seek event).
+-- catches up when mpv empties the filter anyway (see catch_up).
 local function adjust()
     local ok = true
     local function send(cmd, arg, target)
@@ -544,9 +544,13 @@ local function run_queue()
                 local first, second = r.stdout:match("^[^\t]*\t([^\t]*)\t([^\t\n]*)")
                 devices = { first or names[1], second or names[2] }
                 lost = {}
+                -- Other headphones bring their own loudness and delay. The
+                -- reopened output gets our filter built anew from its
+                -- string, so that has them, and any live changes, first.
+                restore()
+                if ours then set_af(true) end
                 mp.commandv("ao-reload")
-                -- Other headphones bring their own loudness and delay.
-                if restore() then tune() else publish() end
+                publish()
                 job.done()
             else
                 local why = (r and r.stderr or ""):gsub("^audio%-pairs: ", ""):gsub("%s+$", "")
@@ -629,12 +633,16 @@ mp.observe_property("audio-device", nil, function()
 end)
 for _, prop in ipairs(sub_props) do mp.observe_property(prop, "number", subs_changed) end
 
--- mpv rebuilds the --af filter from its string after a seek, emptying it
--- first: the moment to write live changes into the string, with nothing
--- in the old filter to lose.
-mp.register_event("seek", function()
+-- mpv builds the --af filter anew from its string after a seek and when it
+-- reopens the audio output (another output device, ao-reload), with nothing
+-- in the old one to lose: the moments to write live changes into the
+-- string. Should mpv get sound through before this runs, that moment still
+-- has the old values.
+local function catch_up()
     if ours then set_af(true) end
-end)
+end
+mp.register_event("seek", catch_up)
+mp.register_event("audio-reconfig", catch_up)
 
 -- Pairs mode on an ordinary stereo device folds channels 3-4 into 1-2, so
 -- everyone hears both languages. Say so instead of leaving it a mystery.

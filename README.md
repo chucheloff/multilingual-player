@@ -245,9 +245,9 @@ delays an `adelay` holds the later side back by the difference, and
 `asetpts` moves both by the earlier side's delay (earlier, for a negative
 one); the earlier side is never held back itself, as `adelay`'s leading
 silence would have no timestamps. That leaves mpv's own audio delay alone,
-which mpv saves for the next start on `Shift+Q`. mpv rebuilds `--af` filters
-on a seek, so the plugin writes the current values into its filter's
-settings at the next seek. `tools/audio-pairs.swift` combines the two headphone outputs
+which mpv saves for the next start on `Shift+Q`. mpv builds `--af` filters
+anew from their settings on a seek and when it reopens the audio output, so
+the plugin writes the current values into its filter's settings then. `tools/audio-pairs.swift` combines the two headphone outputs
 into one CoreAudio *aggregate device*: channels 1–2 go to the first pair, 3–4
 to the second. The second pair follows the first one's clock (drift
 correction). The device exists only while `dualplay` runs.

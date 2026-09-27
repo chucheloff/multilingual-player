@@ -560,6 +560,17 @@ class Keys(Playing):
         self.assertIn("volume@dual_audio1=0dB", self.af_graph())
         self.assertIn("volume@dual_audio2=-6dB", self.af_graph())
 
+    def test_live_values_after_reload(self):
+        # mpv builds the --af filter anew from its string when it reopens
+        # the audio output (another output device, ao-reload), too.
+        self.press("a", (1, 2))
+        self.message("set-gain", 2, -6)
+        self.wait_sides([(0, 0), (-6, 0)])
+        self.assertIn("volume@dual_audio2=0dB", self.af_graph())  # live
+        self.mpv.command("ao-reload")
+        self.af_has("volume@dual_audio2=-6dB")
+        self.expect((1, 2))
+
     def test_own_filters_left_alone(self):
         # Ours goes first, on the joined channels; the user's come after,
         # and are all that is left when dual audio goes off.
@@ -669,6 +680,20 @@ class Live(unittest.TestCase):
         left, right = analyze.peaks(out, start=0.5)
         self.assertAlmostEqual(right / left, 10 ** (-6 / 20), delta=0.01)
 
+    def test_kept_after_moving_a_pair(self):
+        # Moving a pair to other headphones reopens the audio output, and
+        # mpv builds the filter anew; a live change made before comes along.
+        # The pcm output starts its WAV again then, so it holds only what
+        # plays after the move.
+        helper, _ = fake_helper(self.tmp.name)
+        out = self.render(("set-gain", 2, -6), ("set-device", 1, "Other Phones"),
+                          opts=("--script-opts-append=dual_audio-mode=pairs", "--audio-channels=quad",
+                                "--script-opts-append=dual_audio-pair_names=Pair A|Pair B",
+                                "--script-opts-append=dual_audio-helper=" + helper))
+        fl, fr, bl, br = analyze.peaks(out)
+        self.assertAlmostEqual(bl / fl, 10 ** (-6 / 20), delta=0.01)
+        self.assertAlmostEqual(br / fr, 10 ** (-6 / 20), delta=0.01)
+
     def test_output_brings_its_settings(self):
         # In ears mode another output device has settings of its own (saved
         # before here), and they are heard once mpv plays to it. The WAV
@@ -713,6 +738,9 @@ class Devices(unittest.TestCase):
     def wait_logged(self, text):
         self.mpv.wait_for(lambda: text in read(self.log))
 
+    def af_has(self, *parts):
+        self.mpv.wait_for(lambda: all(p in af_graph(self.mpv) for p in parts))
+
     def wait_lost(self, lost):
         self.mpv.wait_for(lambda: [s.get("lost", False) for s in self.sides()] == lost)
 
@@ -751,12 +779,13 @@ class Devices(unittest.TestCase):
         self.mpv.wait_for(lambda: [s["gain"] for s in self.sides()] == [0, -6])
         self.message("set-device", 1, "Friend, Pro")
         self.mpv.wait_for(lambda: self.devices() == ["Friend, Pro", "Nikita’s AirPods"])
-        self.mpv.wait_for(lambda: [s["gain"] for s in self.sides()] == [-6, 0])
+        self.af_has("volume@dual_audio1=-6dB", "volume@dual_audio2=0dB")
+        self.assertEqual([s["gain"] for s in self.sides()], [-6, 0])
         self.message("set-delay", 2, 120)  # Nikita's
         self.mpv.wait_for(lambda: [s["delay"] for s in self.sides()] == [0, 120])
         self.message("set-device", 2, "Other Phones")
         self.mpv.wait_for(lambda: self.devices() == ["Friend, Pro", "Other Phones"])
-        self.mpv.wait_for(lambda: [(s["gain"], s["delay"]) for s in self.sides()] == [(-6, 0), (0, 0)])
+        self.af_has("volume@dual_audio1=-6dB", "volume@dual_audio2=0dB", "delays=0|0|0|0")
         self.mpv.wait_for(lambda: abs(self.mpv.get("time-pos") - 3.0) < 0.05)
         with open(os.path.join(self.tmp.name, "devices.json")) as f:
             self.assertEqual(json.load(f), {"Friend, Pro": {"gain": -6, "delay": 0},
