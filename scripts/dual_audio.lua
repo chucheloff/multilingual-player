@@ -136,10 +136,8 @@ end
 
 -- Changing lavfi-complex during playback makes mpv stop reading the
 -- subtitle streams while sid still names them, so subtitles vanish once the
--- packets already read run out. Select them again once playback restarts
--- after apply()'s seek - done right away, it races that seek.
+-- packets already read run out. Selecting them again brings them back.
 local function reselect_subs()
-    mp.unregister_event(reselect_subs)
     for _, prop in ipairs({ "sid", "secondary-sid" }) do
         local id = mp.get_property_number(prop)
         if id then
@@ -149,10 +147,11 @@ local function reselect_subs()
     end
 end
 
--- Installs or removes the graph. `live` means playback is under way: mpv's
--- refresh seek for the newly decoded tracks lands on the next keyframe
--- (up to ~10s ahead), so seek back to the exact position. The seek has to
--- wait a tick - issued right away it is lost when paused.
+-- Installs or removes the graph. `live` means playback is under way: mpv
+-- then re-reads the file for the newly selected tracks, and its refresh seek
+-- can land on the next keyframe (up to ~10s ahead). A seek of our own issued
+-- while that re-read is going on loses its keyframe the same way, so drop
+-- the re-read first, then seek to the exact position.
 local function apply(live)
     local tracks = audio_tracks()
     local want = enabled and #tracks >= 2
@@ -163,14 +162,12 @@ local function apply(live)
     local pos = live and mp.get_property_number("time-pos")
     mp.set_property("lavfi-complex", want and graph() or "")
     ours = want
-    if live then
-        mp.unregister_event(reselect_subs)
-        mp.register_event("playback-restart", reselect_subs)
-    end
     -- Back to normal playback: keep the left-ear / first-pair language.
     if not want and left then mp.set_property_number("aid", left) end
+    if live then reselect_subs() end
     if pos then
-        mp.add_timeout(0, function() mp.commandv("seek", pos, "absolute+exact") end)
+        mp.commandv("drop-buffers")
+        mp.commandv("seek", pos, "absolute+exact")
     end
 end
 
