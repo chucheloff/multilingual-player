@@ -2,15 +2,17 @@
 // mpv (libmpv) running dual_audio.lua, and check what each click did.
 // Built together with tools/bubbatv-menu.swift (hence main.swift) and run by
 // tests/test_dual_audio.py (Menu.test_clicks, Menu.test_device_clicks):
-//   menu_clicks FILE DUAL_AUDIO_LUA     prints "ok ..." lines; exits 1 on a failure
-//   menu_clicks FILE DUAL_AUDIO_LUA HELPER LOG
+//   menu_clicks FILE DUAL_AUDIO_LUA DEVICES_JSON
+//       prints "ok ..." lines; exits 1 on a failure. The script remembers
+//       the loudness set by a click in DEVICES_JSON.
+//   menu_clicks FILE DUAL_AUDIO_LUA DEVICES_JSON HELPER LOG
 //       pairs mode as under dualplay -2 ("Pair A", "Pair B"), with HELPER in
 //       place of tools/audio-pairs: moves the pairs to other headphones.
 //       Outputs come from BUBBATV_DEVICES; mpv logs to LOG.
 import Cocoa
 
 let args = CommandLine.arguments
-let pairs = args.count == 5
+let pairs = args.count == 6
 setvbuf(stdout, nil, _IOLBF, 0)
 _ = NSApplication.shared
 // Stands in for mpv's menu bar: the plugin goes before "Window".
@@ -19,12 +21,12 @@ bar.addItem(withTitle: "Window", action: nil, keyEquivalent: "")
 NSApp.mainMenu = bar
 
 let mpv = mpv_create()!
-var options = [("vo", "null"), ("ao", "null"), ("pause", "yes"), ("start", "3"),
-               ("scripts", args[2]), ("script-opts", "dual_audio-auto=yes")]
+var options = [("vo", "null"), ("ao", "null"), ("pause", "yes"), ("start", "3"), ("scripts", args[2]),
+               ("script-opts", "dual_audio-auto=yes,dual_audio-devices_file=\(args[3])")]
 if pairs {
-    options += [("script-opts", "dual_audio-auto=yes,dual_audio-mode=pairs,"
-                 + "dual_audio-pair_names=Pair A|Pair B,dual_audio-helper=" + args[3]),
-                ("log-file", args[4])]
+    options += [("script-opts", "dual_audio-auto=yes,dual_audio-devices_file=\(args[3]),dual_audio-mode=pairs,"
+                 + "dual_audio-pair_names=Pair A|Pair B,dual_audio-helper=" + args[4]),
+                ("log-file", args[5])]
 }
 for (k, v) in options {
     mpv_set_option_string(mpv, k, v)

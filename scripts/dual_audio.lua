@@ -19,6 +19,7 @@
 -- `script-message-to dual_audio set-track|set-gain|set-delay SIDE VALUE`
 -- (SIDE 1 = left ear / first pair, 2 = the other; gain in dB, delay in ms).
 -- The state is published in user-data/dual_audio for the menu.
+-- Loudness and delay are remembered per headphones (see device_key).
 --
 -- Subtitles can follow the sides (follow_subs, or the follow-subs binding,
 -- which has no key of its own): the first side's language as the main
@@ -34,6 +35,7 @@
 
 local msg = require "mp.msg"
 local options = require "mp.options"
+local utils = require "mp.utils"
 
 local opts = {
     auto = false,       -- turn on automatically for files with 2+ audio tracks
@@ -44,6 +46,7 @@ local opts = {
     helper = "",        -- pairs mode: tools/audio-pairs, to rebuild the combined device (dualplay sets it)
     balance_step = 2,   -- dB per balance keypress
     follow_subs = false, -- subtitles in both sides' languages (see update_subs)
+    devices_file = "~~/dual_audio-devices.json",  -- remembered loudness and delay; "" for none
 }
 options.read_options(opts, "dual_audio")
 local pairs_mode = opts.mode == "pairs"
@@ -63,7 +66,6 @@ local enabled = opts.auto
 local left, right       -- track ids for the current file (may be the same)
 local gain = { 0, 0 }   -- dB per side: left ear / first pair, then the other
 local delay = { 0, 0 }  -- ms per side; negative plays that side earlier
-local delay_shift = 0   -- s added to audio-delay for negative delays (see apply)
 local ours = false      -- lavfi-complex currently holds our graph
 -- Languages to look for in the next file; follows manual track changes so a
 -- playlist of episodes keeps the same assignment.
@@ -148,9 +150,12 @@ local function remember(tracks)
     pref.same = left == right
 end
 
--- The graph can only hold a side back, so negative delays shift both sides
--- later by the most negative one, and mpv's audio-delay takes it back.
-local function base_delay() return math.min(0, delay[1], delay[2]) end
+-- adelay only holds a side back, so it holds back the later side by the
+-- difference, and asetpts moves the whole output by the earlier side's
+-- delay, either way. Not mpv's audio-delay: mpv writes that into
+-- watch-later files (inside the quit command, with no event before it),
+-- and the next start would be off by the shift.
+local function base_delay() return math.min(delay[1], delay[2]) end
 
 local function input(src, side, pad)
     local d = delay[side] - base_delay()
@@ -165,10 +170,17 @@ local function graph()
     -- A track feeds only one filter, so split it when both sides play it.
     if left == right then split, l, r = l .. "asplit=2[sl][sr];", "[sl]", "[sr]" end
     local g = split .. input(l, 1, "l") .. input(r, 2, "r")
+    -- join takes its timestamps from its first input, and adelay's leading
+    -- silence has none: mpv would then misplace both sides against the
+    -- picture. So the side held back goes in second.
+    local ins, a, b = "[l][r]", 0, 1  -- join inputs; which one is l, which r
+    if delay[1] > delay[2] then ins, a, b = "[r][l]", 1, 0 end
+    local out = base_delay() ~= 0 and string.format(",asetpts=PTS%+g/TB", base_delay() / 1000) or ""
     if pairs_mode then
-        return g .. "[l][r]join=inputs=2:channel_layout=quad:map=0.0-FL|0.1-FR|1.0-BL|1.1-BR[ao]"
+        return g .. string.format("%sjoin=inputs=2:channel_layout=quad:map=%d.0-FL|%d.1-FR|%d.0-BL|%d.1-BR%s[ao]",
+            ins, a, a, b, b, out)
     end
-    return g .. "[l][r]join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR[ao]"
+    return g .. string.format("%sjoin=inputs=2:channel_layout=stereo:map=%d.0-FL|%d.0-FR%s[ao]", ins, a, b, out)
 end
 
 local function label(tracks, id)
@@ -178,18 +190,82 @@ local function label(tracks, id)
     return s
 end
 
+-- The output mpv plays to by name, or nil for the system default output:
+-- mpv only calls that "auto" (the menu looks it up through CoreAudio).
+local function output()
+    local out = mp.get_property("audio-device", "auto")
+    if out == "auto" then return nil end
+    for _, d in ipairs(mp.get_property_native("audio-device-list", {})) do
+        if d.name == out then return d.description end
+    end
+    return out
+end
+
+-- Loudness and delay are saved per headphones, by name: in pairs mode each
+-- pair's device. In ears mode both ears share one output, so each ear of it
+-- has an entry, e.g. "system output (left ear)" - mpv's default output,
+-- which is whichever headphones the Mac plays to.
+local function device_key(i)
+    return devices[i] or string.format("%s (%s)", output() or "system output", side_names[i]:lower())
+end
+
+-- The saved settings, { [device_key] = { gain = dB, delay = ms } }, as in
+-- devices_file. With --no-config "~~/" has no directory to point to (mpv
+-- skips its watch-later files then too), so they last only while mpv runs.
+local saved = {}
+local store = opts.devices_file ~= "" and mp.command_native({ "expand-path", opts.devices_file }) or nil
+if store and opts.devices_file:find("^~~") and not store:find("^/") then store = nil end
+
+local function load()
+    local f = store and io.open(store)
+    if not f then return end
+    local t = utils.parse_json(f:read("*a"))
+    f:close()
+    if type(t) == "table" then saved = t end
+end
+
+-- Takes the settings of the sides' devices; true if that changed anything.
+local function restore()
+    load()
+    local changed = false
+    for i = 1, 2 do
+        local s = saved[device_key(i)]
+        s = type(s) == "table" and s or {}
+        local g, d = tonumber(s.gain) or 0, math.floor((tonumber(s.delay) or 0) + 0.5)
+        changed = changed or g ~= gain[i] or d ~= delay[i]
+        gain[i], delay[i] = g, d
+    end
+    return changed
+end
+
+-- After each loudness or delay change. Re-reads the file first to keep
+-- what another mpv saved meanwhile; a device back at 0 / 0 is dropped.
+local function save()
+    load()
+    for i = 1, 2 do
+        saved[device_key(i)] = (gain[i] ~= 0 or delay[i] ~= 0) and { gain = gain[i], delay = delay[i] } or nil
+    end
+    if not store then return end
+    local tmp = store .. ".tmp"
+    local f = io.open(tmp, "w")
+    if not f then  -- the first save, before mpv's config dir exists
+        mp.command_native({ name = "subprocess", playback_only = false,
+                            args = { "mkdir", "-p", (utils.split_path(store)) } })
+        f = io.open(tmp, "w")
+    end
+    local ok = f and f:write(next(saved) and utils.format_json(saved) or "{}")
+    if f then f:close() end
+    if not (ok and os.rename(tmp, store)) then msg.warn("could not save " .. store) end
+end
+
 -- The state as the bubbaTV menu shows it. `device` is left out when mpv
 -- plays to the system default output; the menu looks that one up.
 local function publish()
     local tracks, list = audio_tracks(), {}
     for _, t in ipairs(tracks) do list[#list + 1] = { id = t.id, title = label(tracks, t.id) } end
-    local out = mp.get_property("audio-device", "auto")
-    for _, d in ipairs(out ~= "auto" and mp.get_property_native("audio-device-list", {}) or {}) do
-        if d.name == out then out = d.description end
-    end
     local sides = {}
     for i, id in ipairs({ left or false, right or false }) do
-        sides[i] = { name = side_names[i], device = devices[i] or (out ~= "auto" and out or nil),
+        sides[i] = { name = side_names[i], device = devices[i] or output(),
                      lost = lost[i], track = id or nil, gain = gain[i], delay = delay[i] }
     end
     mp.set_property_native("user-data/dual_audio", {
@@ -268,12 +344,6 @@ local function apply(live)
     local pos = live and mp.get_property_number("time-pos")
     mp.set_property("lavfi-complex", want and graph() or "")
     ours = want
-    local shift = want and base_delay() / 1000 or 0
-    if shift ~= delay_shift then
-        mp.set_property_number("audio-delay",
-            mp.get_property_number("audio-delay", 0) + shift - delay_shift)
-        delay_shift = shift
-    end
     -- Back to normal playback: keep the left-ear / first-pair language.
     if not want and left then mp.set_property_number("aid", left) end
     update_subs(live)
@@ -351,6 +421,7 @@ local function nudge(side)
     else
         gain[3 - side] = gain[3 - side] - opts.balance_step
     end
+    save()
     apply(true)
     show()
 end
@@ -371,8 +442,8 @@ local setters = {
         if i == 1 then left = id else right = id end
         remember(tracks)
     end,
-    ["set-gain"] = function(i, db) gain[i] = db end,
-    ["set-delay"] = function(i, ms) delay[i] = math.floor(ms + 0.5) end,
+    ["set-gain"] = function(i, db) gain[i] = db; save() end,
+    ["set-delay"] = function(i, ms) delay[i] = math.floor(ms + 0.5); save() end,
 }
 for name, set in pairs(setters) do
     mp.register_script_message(name, function(side, value)
@@ -403,7 +474,8 @@ local function run_queue()
                 devices = { first or names[1], second or names[2] }
                 lost = {}
                 mp.commandv("ao-reload")
-                publish()
+                -- Other headphones bring their own loudness and delay.
+                if restore() and ours then apply(true) else publish() end
                 job.done()
             else
                 local why = (r and r.stderr or ""):gsub("^audio%-pairs: ", ""):gsub("%s+$", "")
@@ -469,6 +541,7 @@ mp.register_event("start-file", function() loading = true end)
 -- Before mpv selects the tracks: it takes the subtitles set here too.
 mp.add_hook("on_preloaded", 50, function()
     left, right = nil, nil
+    restore()
     apply(false)
     loading = false
 end)
@@ -477,9 +550,12 @@ mp.register_event("file-loaded", function()
     if ours then show() end
 end)
 
--- Tracks come and go (next file, --audio-file), and so does the output.
+-- Tracks come and go (next file, --audio-file), and so does the output -
+-- which in ears mode brings its own saved settings.
 mp.observe_property("track-list", nil, publish)
-mp.observe_property("audio-device", nil, publish)
+mp.observe_property("audio-device", nil, function()
+    if restore() and ours then apply(true) else publish() end
+end)
 for _, prop in ipairs(sub_props) do mp.observe_property(prop, "number", subs_changed) end
 
 -- Pairs mode on an ordinary stereo device folds channels 3-4 into 1-2, so
