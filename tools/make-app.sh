@@ -14,15 +14,21 @@ case $app in
   *) echo "make-app.sh: $app: the name has to end in .app" >&2; exit 1 ;;
 esac
 command -v swiftc >/dev/null || { echo "make-app.sh: needs swiftc - xcode-select --install" >&2; exit 1; }
+# An older bubbaTV gets replaced; another app under that name (a typo) stays.
+bundle_id() { plutil -extract CFBundleIdentifier raw -o - "$1" 2>/dev/null; }
+if [ -e "$app" ] && [ "$(bundle_id "$app/Contents/Info.plist")" != "$(bundle_id "$repo/tools/bubbatv-app.plist")" ]; then
+  echo "make-app.sh: $app is not bubbaTV, leaving it alone" >&2; exit 1
+fi
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
-swiftc -O -o "$app/Contents/MacOS/bubbaTV" "$repo/tools/bubbatv-app.swift"
+# Info.plist first, so a build that fails halfway is still ours to replace.
 plist="$app/Contents/Info.plist"
 cp "$repo/tools/bubbatv-app.plist" "$plist"
 plutil -replace BubbaTVDualplay -string "$repo/dualplay" "$plist"
 # Apps started from the Dock get a bare PATH: keep this shell's, which finds
 # mpv, and Homebrew's in case mpv comes later.
 plutil -replace BubbaTVPath -string "$PATH:/opt/homebrew/bin:/usr/local/bin" "$plist"
+swiftc -O -o "$app/Contents/MacOS/bubbaTV" "$repo/tools/bubbatv-app.swift"
 codesign --force --sign - "$app"
 echo "built $app"

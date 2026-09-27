@@ -34,7 +34,7 @@ tools/make-app.sh ~/Applications/bubbaTV.app
 
 Then drop a movie on **bubbaTV** (keep it in the Dock, or in Finder), or
 right-click a movie → Open With → bubbaTV. Opened on its own, it offers to pick
-one. It plays with `dualplay`: on two pairs (`-2`) when two Bluetooth
+one. It plays with `dualplay`: on two pairs (`-2`) when exactly two Bluetooth
 headphones are connected, otherwise on one shared pair, an ear each. The
 languages are `left_lang` / `right_lang` from `dual_audio.conf` (see
 [Install as a plugin](#install-as-a-plugin)); without them, the track that
@@ -49,7 +49,8 @@ order. bubbaTV quits when mpv does, and quitting bubbaTV stops mpv.
   `tools/.build`, not in the app. If you move the folder, run `make-app.sh`
   again. The app also keeps the `PATH` of the shell that built it, so it finds
   `mpv` and `swiftc` as that shell does.
-- Without an argument `make-app.sh` builds `tools/.build/bubbaTV.app`. To see
+- `make-app.sh` replaces an older bubbaTV, but never another app of that name.
+  Without an argument it builds `tools/.build/bubbaTV.app`. To see
   what the app would run: `~/Applications/bubbaTV.app/Contents/MacOS/bubbaTV --dry-run movie.mkv`.
 - If macOS asks whether bubbaTV may access a folder (Downloads, Documents…),
   allow it: mpv reads the movie on its behalf.

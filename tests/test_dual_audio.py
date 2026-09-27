@@ -602,6 +602,33 @@ class App(unittest.TestCase):
         self.assertEqual({t["UTTypeIdentifier"] for t in info["UTImportedTypeDeclarations"]},
                          {"org.matroska.mkv", "org.webmproject.webm"})
 
+    def test_rebuild_replaces_only_bubbatv(self):
+        # make-app.sh builds over an older bubbaTV, even one whose build failed,
+        # but not over another app given by mistake.
+        def make(app, path=os.environ["PATH"]):
+            return subprocess.run([os.path.join(ROOT, "tools", "make-app.sh"), app], env=dict(os.environ, PATH=path),
+                                  capture_output=True, text=True, timeout=300)
+        old = os.path.join(self.tmp.name, "old", "bubbaTV.app")
+        shutil.copytree(self.app, old, symlinks=True)
+        out = make(old)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        broken = os.path.join(self.tmp.name, "broken")  # a swiftc that fails
+        os.makedirs(broken)
+        with open(os.path.join(broken, "swiftc"), "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(os.path.join(broken, "swiftc"), 0o755)
+        self.assertEqual(make(old, broken + ":/usr/bin:/bin").returncode, 1)
+        out = make(old)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        other = os.path.join(self.tmp.name, "Other.app", "Contents", "Info.plist")
+        os.makedirs(os.path.dirname(other))
+        with open(other, "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.other"}, f)
+        out = make(os.path.join(self.tmp.name, "Other.app"))
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("is not bubbaTV", out.stderr)
+        self.assertTrue(os.path.exists(other))
+
     def test_two_pairs_with_two_bluetooth_outputs(self):
         for bluetooth, pairs in ((0, ""), (1, ""), (2, "-2 "), (3, "")):
             self.outputs("  MacBook Pro Speakers (2 ch)",
