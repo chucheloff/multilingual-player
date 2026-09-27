@@ -1028,6 +1028,9 @@ class Menu(unittest.TestCase):
                        "--script-opts-append=dual_audio-mode=pairs",
                        "--script-opts-append=dual_audio-pair_names=Nikita’s AirPods|Friend, Pro",
                        *opts, env=env)
+        # The script has published its state, so its keys are bound: a key
+        # pressed before that goes nowhere.
+        self.mpv.wait_for(lambda: self.mpv.get("user-data/dual_audio"))
 
     def outputs(self, *names):
         """The fake list of connected outputs the plugin reads (BUBBATV_DEVICES)."""
