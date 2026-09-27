@@ -732,7 +732,7 @@ class FollowSubs(Playing):
         self.shows("Eng", "Rus")
         self.mpv.command("script-binding", "dual_audio/follow-subs")
         self.shows("Eng", None)
-        self.assertFalse(self.state()["follow_subs"])
+        self.mpv.wait_for(lambda: not self.state()["follow_subs"])  # published just after
         self.mpv.command("script-binding", "dual_audio/follow-subs")
         self.shows("Eng", "Rus")
         self.expect((1, 2))         # still at 3.0s
