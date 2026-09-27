@@ -6,7 +6,8 @@ Watch a movie with a friend in two languages at once, on one Mac:
 - **One pair, shared:** one bud each, a language per ear.
 
 It's a plugin for [mpv](https://mpv.io) (`scripts/dual_audio.lua`) plus a
-small launcher (`dualplay`).
+small launcher (`dualplay`), with a **bubbaTV** menu in mpv's menu bar for
+each pair's track, loudness and delay.
 
 ## Quick start
 
@@ -19,7 +20,8 @@ brew install mpv
 `-l` / `-r` take language codes: `en` and `eng` both work, whichever the file
 uses (mpv lists the tracks at startup). Give a list for fallbacks: `-r fre,eng`.
 If a language has several tracks (dub, voice-overs…), the first one is used;
-press `{` / `}` (Shift+`[` / Shift+`]`) to step through the others. Without `-l` / `-r`, the track that
+press `{` / `}` (Shift+`[` / Shift+`]`) to step through the others, or pick one in the
+bubbaTV menu. Both sides can play the same track, e.g. `-l eng -r eng`. Without `-l` / `-r`, the track that
 would normally play comes first and the next one second. Any other mpv option works after
 the file name, e.g. `--sub-lang=eng`.
 
@@ -36,16 +38,39 @@ Other headphones or speakers work too: `-2` picks the two connected Bluetooth
 outputs, or name them with `-p`, e.g.
 `./dualplay -2 -p "Nikita" -p "MacBook Pro Speakers" movie.mkv`.
 
-Volume: `9` / `0` changes both, `h` / `k` makes one pair quieter than the other.
-If speech lags the picture, `Ctrl+-` plays the audio 100 ms earlier (`Ctrl++` later).
-`samples/sync.mkv` flashes and beeps once a second to check this.
+Volume: `9` / `0` changes both, `h` / `k` makes one pair quieter than the other,
+and the bubbaTV menu sets each pair's loudness on its own.
+If speech lags the picture, `Ctrl+-` plays the audio 100 ms earlier (`Ctrl++` later);
+if only one pair lags (Bluetooth headphones differ), give that pair a negative delay
+in the bubbaTV menu. `samples/sync.mkv` flashes and beeps once a second to check this.
+
+## The bubbaTV menu
+
+`dualplay` adds a **bubbaTV** menu to mpv's menu bar (next to Playback). With
+dual audio on it has a group per pair (or ear):
+
+- **Device** — the headphones (or output) that pair plays on
+- **Audio track** — the track it plays; pick any, the other pair's too
+- **Loudness** — −30 … +6 dB, on top of mpv's volume
+- **Delay** — −1000 … +1000 ms, on top of mpv's audio delay (`Ctrl+-` / `Ctrl++`)
+
+plus switches for dual audio on/off and swapping the pairs. The sliders apply
+a moment after you let go (each change briefly restarts the sound); click a
+value to reset it to 0.
+
+The menu is a native mpv plugin (`tools/bubbatv-menu.swift`). `dualplay`
+compiles it on first run with `swiftc` (`xcode-select --install`) against the
+installed mpv; without `swiftc`, mpv plays as before, just without the menu.
+The script takes the same settings from anywhere:
+`script-message-to dual_audio set-track|set-gain|set-delay SIDE VALUE`
+(SIDE 1 = left ear / first pair, 2 = the other; dB, ms).
 
 ## Keys
 
 | Key | Action |
 | --- | --- |
 | `a` | dual audio on/off (off plays only the first track) |
-| `{` (Shift+`[`) | next track for the **left** ear / first pair |
+| `{` (Shift+`[`) | next track for the **left** ear / first pair (the other side's track included) |
 | `}` (Shift+`]`) | next track for the **right** ear / second pair |
 | `y` | swap |
 | `h` / `k` | balance: make the left ear / first pair louder, or the other side (2 dB steps) |
@@ -66,6 +91,8 @@ the installed copy too.
 
 ```sh
 mkdir -p ~/.config/mpv/scripts && ln -s "$PWD/scripts/dual_audio.lua" ~/.config/mpv/scripts/
+# the bubbaTV menu too, once dualplay has built it:
+ln -s "$PWD/tools/.build/bubbatv.so" ~/.config/mpv/scripts/
 ```
 
 Optional defaults in `~/.config/mpv/script-opts/dual_audio.conf`:
@@ -99,7 +126,9 @@ graph. The plugin builds this graph:
 ```
 
 With `-2` each track stays stereo and the join gives four channels
-(FL FR BL BR). `tools/audio-pairs.swift` combines the two headphone outputs
+(FL FR BL BR). A pair's loudness is its `volume`, its delay an `adelay` in
+front of it (a negative delay delays the other pair and moves mpv's
+audio-delay earlier). When both sides play one track, `asplit` feeds it to both. `tools/audio-pairs.swift` combines the two headphone outputs
 into one CoreAudio *aggregate device*: channels 1–2 go to the first pair, 3–4
 to the second. The second pair follows the first one's clock (drift
 correction). The device exists only while `dualplay` runs.
@@ -115,8 +144,8 @@ audio filter never sees the second language. Doing this in VLC means patching
 its C core.
 
 One mpv quirk is worked around: changing the graph during playback makes mpv
-jump to the next keyframe (up to ~10 s ahead), so the plugin seeks back to the
-exact position.
+jump to the next keyframe (up to ~10 s ahead), so the plugin drops mpv's
+buffers and seeks back to the exact position.
 
 ## Tests
 
@@ -127,6 +156,8 @@ python3 tests/test_dual_audio.py
 Generates `samples/` (via `tools/make-samples.sh`): `tones.mkv` has a
 distinct sine tone per track, and the tests play it through mpv and check which
 tone lands in which channel, including key presses sent over mpv's IPC socket.
+With `swiftc` they also build the bubbaTV menu, load it into mpv and click
+through it (`tests/menu_clicks/`).
 For listening: `samples/speech.mkv` (English and Russian speech) and
 `samples/sync.mkv` (flash + beep).
 
