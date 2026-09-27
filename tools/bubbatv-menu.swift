@@ -15,6 +15,8 @@
 // and the script's key bindings (seek-back / seek-forward for Playback too).
 // Under dualplay -2 it also lists the connected outputs to move a pair to
 // (set-device) and tells the script when they change (outputs NAME...).
+// With 2+ files in mpv's playlist (a folder of episodes) Playback also steps
+// through them.
 // The menu as built is mirrored as text in user-data/bubbatv/menu (for tests).
 import Cocoa
 import CoreAudio
@@ -66,6 +68,27 @@ struct State: Sendable {
                  lost: s["lost"] as? Bool ?? false, track: s["track"] as? Int,
                  gain: s["gain"] as? Double ?? 0, delay: s["delay"] as? Double ?? 0)
         }
+    }
+}
+
+/// A playlist entry as the Files menu lists it.
+struct Entry: Sendable {
+    let name: String
+    let current: Bool
+}
+
+/// mpv's playlist property, read as JSON: [{"filename": ..., "current": true}, ...].
+/// Entries go by file name; the same name from two folders gets its folder too.
+func entries(json: String) -> [Entry] {
+    guard let data = json.data(using: .utf8),
+          let list = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else { return [] }
+    let paths = list.map { ($0["filename"] as? String ?? "") as NSString }
+    let names = paths.map(\.lastPathComponent)
+    let count = Dictionary(names.map { ($0, 1) }, uniquingKeysWith: +)
+    return list.indices.map { i in
+        let folder = (paths[i].deletingLastPathComponent as NSString).lastPathComponent
+        let twice = count[names[i]]! > 1 && !folder.isEmpty
+        return Entry(name: twice ? "\(names[i]) (\(folder))" : names[i], current: list[i]["current"] as? Bool ?? false)
     }
 }
 
@@ -249,6 +272,7 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
     private let menu = NSMenu(title: "bubbaTV")
     private var state = State()
     private var outputs: [String] = []  // connected, for the Device menus
+    private var playlist: [Entry] = []
     private var open = false
 
     init(_ mpv: Mpv) {
@@ -279,6 +303,11 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
     func update(_ state: State) {
         self.state = state
         // Not under the pointer: rebuilding would pull a slider out of a drag.
+        if !open { rebuild() }
+    }
+
+    func update(_ playlist: [Entry]) {
+        self.playlist = playlist
         if !open { rebuild() }
     }
 
@@ -331,15 +360,38 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
         mirror()
     }
 
-    /// Whenever a file is loaded, dual audio on or off: Back / Forward seek
-    /// exactly, as Left / Right do.
+    /// Dual audio on or off: whenever a file is loaded, Back / Forward seek
+    /// exactly, as Left / Right do; with a folder of episodes, previous / next
+    /// file and the whole playlist to pick from.
     private func playback() {
-        guard state.fileLoaded else { return }
+        let episodes = playlist.count > 1
+        guard state.fileLoaded || episodes else { return }
         menu.addItem(.separator())
         menu.addItem(header("Playback"))
-        let step = String(format: "%g", state.seekStep)
-        menu.addItem(item("Back \(step) s", #selector(back)))
-        menu.addItem(item("Forward \(step) s", #selector(forward)))
+        if state.fileLoaded {
+            let step = String(format: "%g", state.seekStep)
+            menu.addItem(item("Back \(step) s", #selector(back)))
+            menu.addItem(item("Forward \(step) s", #selector(forward)))
+        }
+        guard episodes else { return }
+        let pos = playlist.firstIndex { $0.current }
+        let prev = item("Previous file", #selector(previous))
+        prev.isEnabled = (pos ?? 0) > 0
+        menu.addItem(prev)
+        let next = item("Next file", #selector(next))
+        next.isEnabled = pos.map { $0 < playlist.count - 1 } ?? false
+        menu.addItem(next)
+        let files = NSMenuItem(title: "Files", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        for (i, entry) in playlist.enumerated() {
+            let it = item(entry.name, #selector(play(_:)))
+            it.tag = i
+            it.state = entry.current ? .on : .off
+            sub.addItem(it)
+        }
+        files.submenu = sub
+        menu.addItem(files)
     }
 
     /// "Device: Nikita’s AirPods" - under dualplay -2 with the connected
@@ -403,6 +455,9 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
     @objc private func swap() { mpv.command("script-binding", "dual_audio/swap") }
     @objc private func followSubs() { mpv.command("script-binding", "dual_audio/follow-subs") }
     @objc private func calibrate() { mpv.command("script-binding", "dual_audio/calibrate") }
+    @objc private func previous() { mpv.command("playlist-prev") }
+    @objc private func next() { mpv.command("playlist-next") }
+    @objc private func play(_ sender: NSMenuItem) { mpv.command("playlist-play-index", "\(sender.tag)") }
 
     @objc private func pick(_ sender: NSMenuItem) {
         guard let v = sender.representedObject as? [Int] else { return }
@@ -443,19 +498,27 @@ public func mpvOpenCplugin(_ handle: OpaquePointer?) -> Int32 {
         bubba = BubbaMenu(mpv)
         bubba?.install()
     }
+    let playlist: UInt64 = 1  // reply_userdata telling the two properties apart
     mpv_observe_property(handle, 0, "user-data/dual_audio", MPV_FORMAT_STRING)
+    mpv_observe_property(handle, playlist, "playlist", MPV_FORMAT_STRING)
     while true {
         let event = mpv_wait_event(handle, -1).pointee
         if event.event_id == MPV_EVENT_SHUTDOWN { break }
         guard event.event_id == MPV_EVENT_PROPERTY_CHANGE,
               let prop = event.data?.assumingMemoryBound(to: mpv_event_property.self).pointee
         else { continue }
-        var state = State()
+        var json = ""
         if prop.format == MPV_FORMAT_STRING,
-           let json = prop.data?.assumingMemoryBound(to: UnsafePointer<CChar>?.self).pointee {
-            state = State(json: String(cString: json)) ?? State()
+           let s = prop.data?.assumingMemoryBound(to: UnsafePointer<CChar>?.self).pointee {
+            json = String(cString: s)
         }
-        DispatchQueue.main.async { bubba?.update(state) }
+        if event.reply_userdata == playlist {
+            let list = entries(json: json)
+            DispatchQueue.main.async { bubba?.update(list) }
+        } else {
+            let state = State(json: json) ?? State()
+            DispatchQueue.main.async { bubba?.update(state) }
+        }
     }
     mpv.close()
     return 0

@@ -1,5 +1,6 @@
 // bubbaTV.app - play a movie with dualplay, no terminal needed: drop it on
-// the app (Dock or Finder) or use Open With > bubbaTV. tools/make-app.sh
+// the app (Dock or Finder) or use Open With > bubbaTV. A folder of episodes
+// works the same way: dualplay plays its .mkv files. tools/make-app.sh
 // builds it and bakes two things into its Info.plist: where dualplay is (this
 // checkout) and the PATH to find mpv with. The languages come from
 // dual_audio.conf, as with dualplay itself.
@@ -23,7 +24,8 @@ struct Problem: Error {
     let detail: String
 
     static let nothing = Problem(title: "Nothing to play", detail:
-        "Drop a movie on bubbaTV in the Dock or in Finder, or right-click a movie and choose Open With > bubbaTV.")
+        "Drop a movie or a folder of episodes on bubbaTV in the Dock or in Finder, "
+        + "or right-click one and choose Open With > bubbaTV.")
 }
 
 /// dualplay with these arguments, run with the baked-in PATH.
@@ -116,6 +118,7 @@ final class App: NSObject, NSApplicationDelegate {
         guard alert.runModal() == .alertFirstButtonReturn else { return NSApp.terminate(nil) }
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = true  // a folder of episodes
         panel.allowedContentTypes = [.movie] + ["mkv", "webm"].compactMap { UTType(filenameExtension: $0) }
         guard panel.runModal() == .OK else { return NSApp.terminate(nil) }
         play(panel.urls.map(\.path))

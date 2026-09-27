@@ -10,8 +10,8 @@ small launcher (`dualplay`), with a **bubbaTV** menu in mpv's menu bar for
 each pair's headphones, track, loudness and delay, and subtitles in both
 languages. Loudness and delay are remembered per headphones, and a sync
 pattern helps set the delays. `←` / `→` go back and forth exactly 5 seconds,
-to hear a line again. The **bubbaTV** app starts a movie without the
-terminal.
+to hear a line again, and a folder of episodes plays one after another. The
+**bubbaTV** app starts a movie without the terminal.
 
 ## Quick start
 
@@ -19,6 +19,7 @@ terminal.
 brew install mpv
 ./dualplay -2 -l eng -r rus movie.mkv    # two pairs: eng on one, rus on the other
 ./dualplay -l eng -r rus movie.mkv       # one pair: eng left ear, rus right ear
+./dualplay -2 -l eng -r rus "Season 1"   # a folder: its episodes, one after another
 ```
 
 `-l` / `-r` take language codes: `en` and `eng` both work, whichever the file
@@ -29,22 +30,41 @@ bubbaTV menu. Both sides can play the same track, e.g. `-l eng -r eng`. Without 
 would normally play comes first and the next one second. Any other mpv option works after
 the file name, e.g. `--sub-lang=eng`.
 
+## A folder of episodes
+
+Give `dualplay` a folder instead of a file and it plays the folder's `.mkv`
+files (`.MKV` too) one after another, in episode order: "Episode 2" before
+"Episode 10". The next episode keeps the languages you chose, and the bubbaTV
+menu's [Playback](#the-bubbatv-menu) section steps through them.
+
+- Only the folder itself is searched, not its subfolders: in a season folder
+  those hold extras, featurettes and samples, which would otherwise play
+  after the last episode. For several seasons give the season folders:
+  `./dualplay "Season 1" "Season 2"`.
+- Several folders and files work, in the order given: `./dualplay "Season 1" special.mkv`.
+- Hidden files are left out, such as the `._Episode 1.mkv` copies macOS
+  leaves on USB drives, and so are other files (subtitles, `.mp4`, notes).
+- A folder without `.mkv` files stops `dualplay` with an error saying so.
+- Files and folders come first, mpv options after them: from the first
+  argument starting with `-`, everything goes to mpv as it is.
+
 ## bubbaTV.app: without the terminal
 
 ```sh
 tools/make-app.sh ~/Applications/bubbaTV.app
 ```
 
-Then drop a movie on **bubbaTV** (keep it in the Dock, or in Finder), or
-right-click a movie → Open With → bubbaTV. Opened on its own, it offers to pick
-one. It plays with `dualplay`: on two pairs (`-2`) when exactly two Bluetooth
+Then drop a movie or a [folder of episodes](#a-folder-of-episodes) on
+**bubbaTV** (keep it in the Dock, or in Finder), or right-click one → Open
+With → bubbaTV. Opened on its own, it offers to pick one. It plays with
+`dualplay`: on two pairs (`-2`) when exactly two Bluetooth
 headphones are connected, otherwise on one shared pair, an ear each. The
 languages are `left_lang` / `right_lang` from `dual_audio.conf` (see
 [Install as a plugin](#install-as-a-plugin)); without them, the track that
-would normally play comes first. Several files play as a playlist, in name
+would normally play comes first. Several files or folders play as a playlist, in name
 order. bubbaTV quits when mpv does, and quitting bubbaTV stops mpv.
 
-- It is only offered under Open With: it never becomes the default app for movies.
+- It is only offered under Open With: it never becomes the default app for movies or folders.
 - Problems (mpv not installed, nothing to play, playback failing) show up in an alert.
   mpv's output is in `~/Library/Logs/bubbaTV.log`.
 - The app runs `dualplay` from this folder (the path is built in), so a
@@ -112,9 +132,14 @@ when the earlier pair's delay changes, the picture runs a little slower or
 faster for a couple of seconds to catch up. Click a value to reset it to 0.
 Picking a track still restarts the sound for a moment.
 
-Last comes **Playback**, whenever a movie is open (with dual audio off
-too): **Back 5 s** and **Forward 5 s** go exactly that far, like `←` / `→`
-([Keys](#keys)), and the screen shows where playback is now.
+Last comes **Playback**, dual audio on or off:
+
+- **Back 5 s** / **Forward 5 s** — exactly that far, like `←` / `→`
+  ([Keys](#keys)); the screen shows where playback is now
+- With several files ([a folder of episodes](#a-folder-of-episodes)):
+  **Previous file** / **Next file** (greyed out at the first / last one) and
+  **Files** — the whole playlist by file name (with its folder where two
+  share a name), the one playing ticked; pick one to play it
 
 The menu is a native mpv plugin (`tools/bubbatv-menu.swift`). `dualplay`
 compiles it on first run with `swiftc` (`xcode-select --install`) against the
@@ -246,7 +271,8 @@ What else moves playback, as mpv has it:
   buttons right after play/pause in the on-screen controls, `PgUp` / `PgDn`,
   and Playback → Next / Previous Chapter in the menu bar.
 - **Media keys** (previous / next track, `F7` / `F9`; a double / triple press on
-  AirPods): the next / previous file in the playlist; nothing with a single movie.
+  AirPods): the previous / next file in the playlist, such as a
+  [folder's](#a-folder-of-episodes) episodes; nothing with a single movie.
 - `↑` / `↓`: a minute, to a keyframe. `Shift+↑` / `Shift+↓`: exactly 5 s,
   without showing it on screen. Clicking the progress bar: exactly there.
 
@@ -281,7 +307,8 @@ devices_file=~~/dual_audio-devices.json
 ## Good to know
 
 - **Separate dub file:** `./dualplay -r rus movie.mkv --audio-file=movie.rus.mka`
-- **Series:** in a playlist, the next episode keeps the languages you chose.
+- **Series:** in a playlist, the next episode keeps the languages you chose;
+  give `dualplay` the season's folder ([above](#a-folder-of-episodes)).
 - **Quit and resume** (`Shift+Q`) saves your own audio delay (`Ctrl+-` / `Ctrl++`)
   as mpv does; the pairs' delays come back from their headphones.
 - **With one shared pair, each ear gets a mono downmix** of its track. For 5.1 tracks the centre
@@ -366,7 +393,8 @@ or loudness during playback and measure when and how loud each channel's
 beeps come out, and that nothing seeks. They also calibrate, measuring
 when each channel beeps against when the picture flashes (brightness logged
 by a `--vf` filter), and check what Done puts back. Remembered settings and
-watch-later files go to temp dirs.
+watch-later files go to temp dirs, and so do the folders of short
+`tones.mkv` copies that check which episodes `dualplay` plays, in what order.
 With `swiftc` they also build the bubbaTV menu, load it into mpv and click
 through it (`tests/menu_clicks/`). They build bubbaTV.app too and check the
 command its `--dry-run` prints.
