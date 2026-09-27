@@ -65,6 +65,10 @@ would normally play comes first. Several files or folders play as a playlist, in
 order. bubbaTV quits when mpv does, and quitting bubbaTV stops mpv.
 
 - It is only offered under Open With: it never becomes the default app for movies or folders.
+- Built into `/Applications` or `~/Applications`, it is under Open With straight
+  away (`make-app.sh` registers it with macOS); built anywhere else, only once it
+  has been opened. If Finder still doesn't list it, relaunch Finder
+  (Option-right-click its Dock icon → Relaunch).
 - Problems (mpv not installed, nothing to play, playback failing) show up in an alert.
   mpv's output is in `~/Library/Logs/bubbaTV.log`.
 - The app runs `dualplay` from this folder (the path is built in), so a
