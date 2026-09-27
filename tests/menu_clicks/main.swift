@@ -10,10 +10,13 @@
 //       pairs mode as under dualplay -2 ("Pair A", "Pair B"), with HELPER in
 //       place of tools/audio-pairs: moves the pairs to other headphones.
 //       Outputs come from BUBBATV_DEVICES; mpv logs to LOG.
+//   menu_clicks playlist DUAL_AUDIO_LUA DEVICES_JSON FILE FILE FILE
+//       steps through the playlist with the Playback section (Menu.test_playback_clicks).
 import Cocoa
 
 let args = CommandLine.arguments
 let pairs = args.count == 6
+let files = args[1] == "playlist" ? Array(args[4...]) : [args[1]]
 setvbuf(stdout, nil, _IOLBF, 0)
 _ = NSApplication.shared
 // Stands in for mpv's menu bar: the plugin goes before "Window".
@@ -33,7 +36,9 @@ for (k, v) in options {
     mpv_set_option_string(mpv, k, v)
 }
 mpv_initialize(mpv)
-mpv_command_string(mpv, "loadfile \"\(args[1])\"")
+for file in files {
+    mpv_command_string(mpv, "loadfile \"\(file)\" append-play")
+}
 // mpv runs a C plugin on a thread of its own with a client handle, and
 // destroys the handle when the plugin returns.
 let client = mpv_create_client(mpv, "bubbatv")
@@ -117,10 +122,29 @@ func check(_ what: String, _ ok: Bool) {
     row.subviews.compactMap { $0 as? NSButton }.first { $0.title == "+" }!
 }
 
+// The Playback section: which file is checked in Files, and whether
+// Previous / Next file can be clicked there.
+@MainActor func playing() -> [String] {
+    let filesMenu = menu().item(withTitle: "Files")?.submenu
+    return [filesMenu?.items.first { $0.state == .on }?.title ?? "none"]
+        + ["Previous file", "Next file"].map { menu().item(withTitle: $0)?.isEnabled == true ? "enabled" : "disabled" }
+}
+
+func playlist() {
+    let names = files.map { ($0 as NSString).lastPathComponent }
+    wait("playback section") { ui { playing() } == [names[0], "disabled", "enabled"] }
+    ui { click(menu(), "Next file") }
+    wait("next file") { get("playlist-pos") == "1" && ui { playing() } == [names[1], "enabled", "enabled"] }
+    ui { click(menu().item(withTitle: "Files")!.submenu!, names[2]) }
+    wait("the last one from Files") { get("playlist-pos") == "2" && ui { playing() } == [names[2], "enabled", "disabled"] }
+    ui { click(menu(), "Previous file") }
+    wait("previous file") { get("playlist-pos") == "1" && ui { playing() } == [names[1], "enabled", "enabled"] }
+}
+
 Thread {
     wait("menu installed before Window") { ui { bar.items.map(\.title) } == ["bubbaTV", "Window"] }
-    if pairs {
-        devices()
+    if pairs || files.count > 1 {
+        if pairs { devices() } else { playlist() }
         mpv_terminate_destroy(mpv)
         exit(0)
     }

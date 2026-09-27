@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # dualplay - play a video with two audio tracks at once.
 #
-# Usage: dualplay [-2] [-p NAME -p NAME] [-l LANGS] [-r LANGS] FILE [mpv options...]
+# Usage: dualplay [-2] [-p NAME -p NAME] [-l LANGS] [-r LANGS] FILE|FOLDER... [mpv options...]
 #        dualplay -L
 #   -l LANGS  languages for the left ear (with -2: first pair), e.g. "eng,en"
 #   -r LANGS  languages for the right ear (with -2: second pair), e.g. "rus,ru"
@@ -10,9 +10,10 @@
 #   -p NAME   with -2, use this output (part of its name) instead; give it twice
 #   -L        list the connected outputs (names for -p) and exit
 # Without -l/-r the track that would normally play comes first, the next one second.
+# A folder plays its .mkv files in episode order (not those in its subfolders).
 set -euo pipefail
 
-usage() { sed -n '4,13s/^# \{0,1\}//p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '4,14s/^# \{0,1\}//p' "$0"; exit "${1:-0}"; }
 
 left="" right="" pairs="" list="" names=()
 while getopts "l:r:2p:Lh" opt; do
@@ -40,8 +41,36 @@ build_helper() {
 }
 if [ -n "$list" ]; then build_helper; exec "$helper" list; fi
 
-[ $# -ge 1 ] || usage 1
 [ ${#names[@]} -eq 0 ] || [ ${#names[@]} -eq 2 ] || { echo "dualplay: give -p twice" >&2; exit 1; }
+
+# A folder's .mkv files in episode order ("Episode 2" before "Episode 10"),
+# NUL-separated. Any case of .mkv; hidden files (macOS leaves "._" copies on
+# USB drives) and subfolders - extras and samples in a season folder - stay out.
+mkvs() {
+  local f
+  shopt -s nullglob nocaseglob
+  for f in "${1%/}"/*.mkv; do
+    [ ! -f "$f" ] || printf '%s\0' "$f"
+  done | sort -z -f -V
+  shopt -u nullglob nocaseglob
+}
+
+# Files and folders come first: the first argument starting with "-" and all
+# after it are mpv's. Each folder becomes its episodes, so mpv gets the whole
+# playlist up front (the bubbaTV menu lists it).
+files=()
+while [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; do
+  if [ -d "$1" ]; then
+    n=${#files[@]}
+    while IFS= read -r -d '' f; do files+=("$f"); done < <(mkvs "$1")
+    [ ${#files[@]} -gt "$n" ] || { echo "dualplay: no .mkv files in $1 (its subfolders are not searched)" >&2; exit 1; }
+  else
+    files+=("$1")
+  fi
+  shift
+done
+[ ${#files[@]} -ge 1 ] || usage 1
+set -- "${files[@]}" "$@"
 
 command -v mpv >/dev/null || { echo "dualplay: mpv not found - brew install mpv" >&2; exit 1; }
 

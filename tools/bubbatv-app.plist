@@ -40,6 +40,19 @@
 				<string>org.webmproject.webm</string>
 			</array>
 		</dict>
+		<!-- A folder of episodes: dualplay plays its .mkv files. -->
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Folder</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.folder</string>
+			</array>
+		</dict>
 	</array>
 	<!-- macOS itself doesn't always know these two. -->
 	<key>UTImportedTypeDeclarations</key>
