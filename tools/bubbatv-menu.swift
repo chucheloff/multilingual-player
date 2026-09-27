@@ -11,6 +11,8 @@
 // It shows the state dual_audio.lua keeps in user-data/dual_audio and changes
 // it with `script-message-to dual_audio set-track|set-gain|set-delay SIDE VALUE`
 // and the script's key bindings.
+// Under dualplay -2 it also lists the connected outputs to move a pair to
+// (set-device) and tells the script when they change (outputs NAME...).
 // The menu as built is mirrored as text in user-data/bubbatv/menu (for tests).
 import Cocoa
 import CoreAudio
@@ -23,6 +25,7 @@ struct Track: Sendable {
 struct Side: Sendable {
     let name: String
     let device: String?  // nil: mpv plays to the system default output
+    let lost: Bool       // its headphones dropped out
     let track: Int?
     let gain: Double     // dB
     let delay: Double    // ms
@@ -31,6 +34,7 @@ struct Side: Sendable {
 /// What dual_audio.lua publishes; `loaded` is false while it hasn't (yet).
 struct State: Sendable {
     var loaded = false, enabled = false, active = false, pairs = false, followSubs = false
+    var switchDevices = false  // dualplay -2: a pair can move to other headphones
     var tracks: [Track] = []
     var sides: [Side] = []
 
@@ -44,14 +48,15 @@ struct State: Sendable {
         active = o["active"] as? Bool ?? false
         pairs = o["mode"] as? String == "pairs"
         followSubs = o["follow_subs"] as? Bool ?? false
+        switchDevices = o["switch_devices"] as? Bool ?? false
         tracks = (o["tracks"] as? [[String: Any]] ?? []).compactMap { t in
             guard let id = t["id"] as? Int else { return nil }
             return Track(id: id, title: t["title"] as? String ?? "[\(id)]")
         }
         sides = (o["sides"] as? [[String: Any]] ?? []).map { s in
             Side(name: s["name"] as? String ?? "?", device: s["device"] as? String,
-                 track: s["track"] as? Int, gain: s["gain"] as? Double ?? 0,
-                 delay: s["delay"] as? Double ?? 0)
+                 lost: s["lost"] as? Bool ?? false, track: s["track"] as? Int,
+                 gain: s["gain"] as? Double ?? 0, delay: s["delay"] as? Double ?? 0)
         }
     }
 }
@@ -66,7 +71,9 @@ final class Mpv: @unchecked Sendable {
 
     init(_ handle: OpaquePointer) { self.handle = handle }
 
-    func command(_ args: String...) {
+    func command(_ args: String...) { command(args) }
+
+    func command(_ args: [String]) {
         lock.lock()
         defer { lock.unlock() }
         guard let handle else { return }
@@ -93,20 +100,66 @@ final class Mpv: @unchecked Sendable {
     }
 }
 
+let system = AudioObjectID(kAudioObjectSystemObject)
+
+func address(_ selector: AudioObjectPropertySelector,
+             _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> AudioObjectPropertyAddress {
+    AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+}
+
+/// A device's name or UID.
+func string(_ id: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String? {
+    var addr = address(selector)
+    var value: Unmanaged<CFString>?
+    var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &value) == noErr, let value else { return nil }
+    return value.takeRetainedValue() as String
+}
+
 /// The system's default output - where mpv plays unless told otherwise.
 func defaultOutputName() -> String? {
-    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-                                          mScope: kAudioObjectPropertyScopeGlobal,
-                                          mElement: kAudioObjectPropertyElementMain)
+    var addr = address(kAudioHardwarePropertyDefaultOutputDevice)
     var id = AudioObjectID(0)
     var size = UInt32(MemoryLayout<AudioObjectID>.size)
-    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id) == noErr
-    else { return nil }
-    addr.mSelector = kAudioObjectPropertyName
-    var name: Unmanaged<CFString>?
-    size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-    guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &name) == noErr, let name else { return nil }
-    return name.takeRetainedValue() as String
+    guard AudioObjectGetPropertyData(system, &addr, 0, nil, &size, &id) == noErr else { return nil }
+    return string(id, kAudioObjectPropertyName)
+}
+
+/// For tests, which must not touch real devices: a file with one output name
+/// per line, read instead of CoreAudio (and checked for changes 5x a second).
+let fakeOutputs = ProcessInfo.processInfo.environment["BUBBATV_DEVICES"]
+
+/// The connected outputs by name - what a pair can move to. The device
+/// tools/audio-pairs.swift combines them into is left out.
+func connectedOutputs() -> [String] {
+    if let fakeOutputs {
+        let text = (try? String(contentsOfFile: fakeOutputs, encoding: .utf8)) ?? ""
+        return text.split(separator: "\n").map(String.init)
+    }
+    var addr = address(kAudioHardwarePropertyDevices)
+    var size: UInt32 = 0
+    AudioObjectGetPropertyDataSize(system, &addr, 0, nil, &size)
+    var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+    AudioObjectGetPropertyData(system, &addr, 0, nil, &size, &ids)
+    return ids.prefix(Int(size) / MemoryLayout<AudioObjectID>.size).filter { id in
+        var streams = address(kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput)
+        var n: UInt32 = 0
+        return AudioObjectGetPropertyDataSize(id, &streams, 0, nil, &n) == noErr && n > 0
+            && string(id, kAudioDevicePropertyDeviceUID) != "com.multilingual-player.audio-pairs"
+    }.compactMap { string($0, kAudioObjectPropertyName) }
+}
+
+/// Calls `changed` on the main thread when devices come or go.
+func watchOutputs(_ changed: @escaping @MainActor () -> Void) {
+    if fakeOutputs != nil {
+        let t = Timer(timeInterval: 0.2, repeats: true) { _ in MainActor.assumeIsolated { changed() } }
+        RunLoop.main.add(t, forMode: .common)
+        return
+    }
+    var addr = address(kAudioHardwarePropertyDevices)
+    AudioObjectAddPropertyListenerBlock(system, &addr, DispatchQueue.main) { _, _ in
+        MainActor.assumeIsolated { changed() }
+    }
 }
 
 /// A menu row "Loudness  − ━━━●━━━ +  -2 dB". The text follows the knob;
@@ -187,6 +240,7 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
     private let mpv: Mpv
     private let menu = NSMenu(title: "bubbaTV")
     private var state = State()
+    private var outputs: [String] = []  // connected, for the Device menus
     private var open = false
 
     init(_ mpv: Mpv) {
@@ -209,12 +263,24 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
         // Before Window and Help, where an app's own menus go.
         main.insertItem(item, at: main.items.firstIndex { $0.title == "Window" } ?? main.items.count)
         mpv.set("user-data/bubbatv/menubar", main.items.map(\.title).joined(separator: ","))
+        outputs = connectedOutputs()
+        watchOutputs { self.outputsChanged() }
         rebuild()
     }
 
     func update(_ state: State) {
         self.state = state
         // Not under the pointer: rebuilding would pull a slider out of a drag.
+        if !open { rebuild() }
+    }
+
+    /// Under dualplay -2 tells dual_audio.lua too: it pauses when a pair's
+    /// headphones drop out.
+    private func outputsChanged() {
+        let now = connectedOutputs()
+        guard now != outputs else { return }
+        outputs = now
+        if state.switchDevices { mpv.command(["script-message-to", "dual_audio", "outputs"] + now) }
         if !open { rebuild() }
     }
 
@@ -236,7 +302,7 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
         for (i, side) in state.sides.enumerated() where state.active {
             menu.addItem(.separator())
             menu.addItem(header(side.name))
-            menu.addItem(disabled("Device: " + (side.device ?? defaultOutputName() ?? "system output")))
+            menu.addItem(device(for: side, i + 1))
             menu.addItem(tracks(for: side, i + 1))
             menu.addItem(row(SliderRow("Loudness", -30...6, step: 1, unit: "dB", value: side.gain) { [mpv] v in
                 mpv.command("script-message-to", "dual_audio", "set-gain", "\(i + 1)", "\(v)")
@@ -253,6 +319,24 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
             menu.addItem(subs)
         }
         mirror()
+    }
+
+    /// "Device: Nikita’s AirPods" - under dualplay -2 with the connected
+    /// outputs to move the pair to.
+    private func device(for side: Side, _ n: Int) -> NSMenuItem {
+        let title = "Device: " + (side.device ?? defaultOutputName() ?? "system output")
+        guard state.switchDevices, let current = side.device else { return disabled(title) }
+        let parent = NSMenuItem(title: title + (side.lost ? " — disconnected" : ""), action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        for name in outputs {
+            let it = item(name, #selector(move(_:)))
+            it.representedObject = ["\(n)", name]
+            it.state = name == current ? .on : .off
+            sub.addItem(it)
+        }
+        parent.submenu = sub
+        return parent
     }
 
     /// "Audio track: [1] English (eng)", with every track to pick from.
@@ -301,6 +385,11 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
     @objc private func pick(_ sender: NSMenuItem) {
         guard let v = sender.representedObject as? [Int] else { return }
         mpv.command("script-message-to", "dual_audio", "set-track", "\(v[0])", "\(v[1])")
+    }
+
+    @objc private func move(_ sender: NSMenuItem) {
+        guard let v = sender.representedObject as? [String] else { return }
+        mpv.command(["script-message-to", "dual_audio", "set-device"] + v)
     }
 
     /// The menu as text, one item per line: "[x]" marks checked items,
