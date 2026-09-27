@@ -19,7 +19,7 @@ brew install mpv
 `-l` / `-r` take language codes: `en` and `eng` both work, whichever the file
 uses (mpv lists the tracks at startup). Give a list for fallbacks: `-r fre,eng`.
 If a language has several tracks (dub, voice-overs…), the first one is used;
-press `(` / `)` to step through the others. Without `-l` / `-r`, the track that
+press `[` / `]` to step through the others. Without `-l` / `-r`, the track that
 would normally play comes first and the next one second. Any other mpv option works after
 the file name, e.g. `--sub-lang=eng`.
 
@@ -45,13 +45,18 @@ If speech lags the picture, `Ctrl+-` plays the audio 100 ms earlier (`Ctrl++` la
 | Key | Action |
 | --- | --- |
 | `a` | dual audio on/off (off plays only the first track) |
-| `(` | next track for the **left** ear / first pair |
-| `)` | next track for the **right** ear / second pair |
+| `[` | next track for the **left** ear / first pair |
+| `]` | next track for the **right** ear / second pair |
 | `y` | swap |
 | `h` / `k` | balance: make the left ear / first pair louder, or the other side (2 dB steps) |
 
+`[` / `]` take over mpv's speed −/+10% keys; `{` / `}` still halve / double the
+speed and Backspace resets it.
+
 Rebind in `~/.config/mpv/input.conf`, e.g. `Ctrl+d script-binding dual_audio/toggle`
 (names: `toggle`, `cycle-left`, `cycle-right`, `swap`, `balance-left`, `balance-right`).
+Lines there win over the plugin's keys, so `[ multiply speed 1/1.1` and
+`] multiply speed 1.1` bring the speed keys back.
 
 ## Install as a plugin
 
