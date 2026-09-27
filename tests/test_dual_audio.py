@@ -5,6 +5,8 @@ Run: python3 tests/test_dual_audio.py   (needs mpv + ffmpeg; builds samples if m
 """
 import json
 import os
+import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -17,6 +19,7 @@ sys.path.insert(0, os.path.join(ROOT, "tests"))
 import analyze  # noqa: E402
 
 SCRIPT = os.path.join(ROOT, "scripts", "dual_audio.lua")
+MENU = os.path.join(ROOT, "tools", "bubbatv-menu.swift")
 TONES = os.path.join(ROOT, "samples", "tones.mkv")  # 1=eng 440Hz, 2=rus 1000Hz 5.1, 3=ger 2500Hz
 BASE = ["mpv", "--no-config", "--script=" + SCRIPT, "--vo=null", "--really-quiet"]
 
@@ -57,6 +60,12 @@ class Render(unittest.TestCase):
         self.assertEqual(self.render("--script-opts-append=dual_audio-auto=yes",
                                      "--script-opts-append=dual_audio-right_lang=fre,ger"),
                          [440, 2500])
+
+    def test_same_language_on_both_sides(self):
+        # Nothing else matches the right side's language: both get the one track.
+        self.assertEqual(self.render("--script-opts=dual_audio-auto=yes,"
+                                     "dual_audio-left_lang=ger,dual_audio-right_lang=ger"),
+                         [2500, 2500])
 
     def test_only_left_preference(self):
         # ger goes left; the right ear takes the first remaining track.
@@ -170,29 +179,60 @@ class Keys(unittest.TestCase):
             g = self.mpv.get("lavfi-complex")
             if expect is None:
                 return g == ""
-            return g.startswith("[aid%d]" % expect[0]) and "[aid%d]" % expect[1] in g
+            ids = [int(i) for i in re.findall(r"\[aid(\d+)\]", g)]
+            return (ids * 2)[:2] == list(expect)  # a track both sides play appears once
         self.mpv.wait_for(routed)
         self.mpv.wait_for(lambda: abs((self.mpv.get("time-pos") or 0) - 3.0) < 0.05)
+
+    def next_file(self):
+        """Go on to the next playlist entry, once it plays (from its --start)."""
+        self.mpv.command("seek", 5, "absolute")  # tells the files apart
+        self.mpv.wait_for(lambda: abs((self.mpv.get("time-pos") or 0) - 5.0) < 0.05)
+        self.mpv.command("playlist-next")
+        self.mpv.wait_for(lambda: self.mpv.get("playlist-pos") == 1)
+        self.mpv.wait_for(lambda: abs((self.mpv.get("time-pos") or 0) - 3.0) < 0.05)
+
+    def message(self, *args):
+        self.mpv.command("script-message-to", "dual_audio", *map(str, args))
+
+    def state(self):
+        return self.mpv.get("user-data/dual_audio")
 
     def test_toggle_cycle_swap(self):
         self.press("a", (1, 2))     # on: current track left, next right
         self.press("}", (1, 3))     # right ear -> next track
-        self.press("}", (1, 2))     # wraps around, skipping the left ear's track
-        self.press("{", (3, 2))     # left ear -> next free track
+        self.press("}", (1, 1))     # wraps around to the left ear's track: both hear it
+        self.assertIn("[aid1]asplit=2", self.mpv.get("lavfi-complex"))
+        self.press("{", (2, 1))     # left ear -> next track
         self.assertEqual(self.mpv.get("speed"), 1)  # { } no longer change the speed
         self.mpv.command("keypress", "]")  # plain ] is mpv's speed key again
         self.mpv.wait_for(lambda: self.mpv.get("speed") > 1)
-        self.expect((3, 2))         # ... and leaves the tracks alone
-        self.press("y", (2, 3))     # swap
+        self.expect((2, 1))         # ... and leaves the tracks alone
+        self.press("y", (1, 2))     # swap
         self.press("a", None)       # off
-        self.assertEqual(self.mpv.get("aid"), 2)  # left-ear language keeps playing
+        self.assertEqual(self.mpv.get("aid"), 1)  # left-ear language keeps playing
 
     def test_choice_carries_to_next_file(self):
         self.press("a", (1, 2))
         self.press("}", (1, 3))
-        self.mpv.command("playlist-next")
-        self.mpv.wait_for(lambda: self.mpv.get("playlist-pos") == 1)
+        self.next_file()
         self.expect((1, 3))
+
+    def test_same_track_carries_to_next_file(self):
+        # Two English tracks: the one both sides share stays shared, rather
+        # than the right side taking the other English one.
+        twice = os.path.join(self.tmp.name, "twice.mkv")
+        subprocess.run(["ffmpeg", "-v", "error", "-i", TONES, "-map", "0:v", "-map", "0:a:0",
+                        "-map", "0:a:0", "-map", "0:a:1", "-c", "copy", twice], check=True)
+        self.mpv.close()
+        os.mkdir(os.path.join(self.tmp.name, "2"))  # a fresh socket path
+        self.mpv = Mpv(os.path.join(self.tmp.name, "2"), "--start=3", "--pause", twice, src=twice)
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") is not None)
+        self.press("a", (1, 2))
+        self.message("set-track", 2, 1)
+        self.expect((1, 1))
+        self.next_file()
+        self.expect((1, 1))
 
     def test_balance(self):
         self.press("a", (1, 2))
@@ -202,6 +242,38 @@ class Keys(unittest.TestCase):
         self.mpv.command("keypress", "h")
         self.mpv.wait_for(lambda: "volume=-2dB[r]" in self.mpv.get("lavfi-complex"))
         self.assertIn("volume=0dB[l]", self.mpv.get("lavfi-complex"))
+
+    def test_menu_messages(self):
+        # What the bubbaTV menu sends, and the state it reads back.
+        self.press("a", (1, 2))
+        self.assertEqual([t["id"] for t in self.state()["tracks"]], [1, 2, 3])
+        self.message("set-track", 2, 1)
+        self.expect((1, 1))
+        self.message("set-track", 1, 3)
+        self.expect((3, 1))
+        self.message("set-gain", 2, -6)
+        self.mpv.wait_for(lambda: "volume=-6dB[r]" in self.mpv.get("lavfi-complex"))
+        self.message("set-delay", 2, 150)
+        self.mpv.wait_for(lambda: "adelay=150:all=1,volume=-6dB[r]" in self.mpv.get("lavfi-complex"))
+        self.expect((3, 1))
+        sides = self.state()["sides"]
+        self.assertEqual([(s["track"], s["gain"], s["delay"]) for s in sides],
+                         [(3, 0, 0), (1, -6, 150)])
+        self.assertEqual([s["name"] for s in sides], ["Left ear", "Right ear"])
+
+    def test_negative_delay_moves_audio_delay(self):
+        # The graph can only hold a side back: the other side is delayed
+        # instead, and mpv's own audio-delay (the user's 0.1 s here) moves
+        # everything earlier - and comes back when dual audio goes off.
+        self.mpv.command("set_property", "audio-delay", 0.1)
+        self.press("a", (1, 2))
+        self.message("set-delay", 1, -200)
+        self.mpv.wait_for(lambda: "adelay=200:all=1,volume=0dB[r]" in self.mpv.get("lavfi-complex"))
+        self.assertNotIn("adelay", self.mpv.get("lavfi-complex").split("[l]")[0])
+        self.assertAlmostEqual(self.mpv.get("audio-delay"), -0.1)
+        self.expect((1, 2))
+        self.press("a", None)
+        self.assertAlmostEqual(self.mpv.get("audio-delay"), 0.1)
 
     def test_av_sync_while_playing(self):
         self.press("a", (1, 2))
@@ -244,6 +316,73 @@ class Subs(unittest.TestCase):
     def test_toggle_off(self):
         self.mpv.command("keypress", "a")
         self.assert_subs_keep_coming()
+
+
+class Menu(unittest.TestCase):
+    """The bubbaTV menu plugin, built with swiftc against this mpv's headers.
+    It mirrors the menu it builds as text in user-data/bubbatv/menu."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.prefix = os.path.dirname(os.path.dirname(os.path.realpath(shutil.which("mpv"))))
+        cls.header = os.path.join(cls.prefix, "include", "mpv", "client.h")
+        if not shutil.which("swiftc") or not os.path.exists(cls.header):
+            raise unittest.SkipTest("needs swiftc and mpv's headers")
+        cls.build = tempfile.TemporaryDirectory()
+        cls.plugin = os.path.join(cls.build.name, "bubbatv.so")
+        cls.swiftc("-emit-library", "-o", cls.plugin, "-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup")
+
+    @classmethod
+    def swiftc(cls, *args, sources=()):
+        subprocess.run(["swiftc", "-O", MENU, *sources, "-import-objc-header", cls.header, *args],
+                       check=True, timeout=300)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.build.cleanup()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.mpv = Mpv(self.tmp.name, "--script=" + self.plugin, "--start=3", "--pause",
+                       "--script-opts-append=dual_audio-mode=pairs",
+                       "--script-opts-append=dual_audio-pair_names=Nikita’s AirPods|Friend, Pro")
+
+    def tearDown(self):
+        self.mpv.close()
+        self.tmp.cleanup()
+
+    def menu(self):
+        return self.mpv.get("user-data/bubbatv/menu") or ""
+
+    def wait_menu(self, text):
+        self.mpv.wait_for(lambda: text in self.menu())
+
+    def test_in_menu_bar(self):
+        self.mpv.wait_for(lambda: "Playback,bubbaTV,Window" in (self.mpv.get("user-data/bubbatv/menubar") or ""))
+
+    def test_follows_the_state(self):
+        self.wait_menu("Dual audio")
+        self.assertNotIn("Pair 1", self.menu())  # off: just the switch
+        self.mpv.command("keypress", "a")
+        self.wait_menu("[x] Dual audio")
+        self.assertIn("Pair 1\nDevice: Nikita’s AirPods (disabled)\nAudio track: [1] English 440Hz (eng)\n"
+                      "  [x] [1] English 440Hz (eng)\n  [2] Russian 1000Hz 5.1 (rus)\n", self.menu())
+        self.assertIn("Pair 2\nDevice: Friend, Pro (disabled)\nAudio track: [2] Russian", self.menu())
+        self.assertIn("Swap pairs", self.menu())
+        for msg in (("set-gain", 2, -6), ("set-delay", 1, 120), ("set-track", 2, 1)):
+            self.mpv.command("script-message-to", "dual_audio", *map(str, msg))
+        self.wait_menu("Pair 2\nDevice: Friend, Pro (disabled)\nAudio track: [1] English 440Hz (eng)\n"
+                       "  [x] [1] English 440Hz (eng)\n  [2] Russian 1000Hz 5.1 (rus)\n"
+                       "  [3] German 2500Hz (ger)\nLoudness -6 dB\nDelay 0 ms")
+        self.assertIn("Loudness 0 dB\nDelay +120 ms", self.menu())
+
+    def test_clicks(self):
+        # Built against libmpv: clicks the real menu items and checks the graph.
+        harness = os.path.join(self.build.name, "menu_clicks")
+        self.swiftc("-o", harness, "-L", os.path.join(self.prefix, "lib"), "-lmpv", sources=[os.path.join(ROOT, "tests", "menu_clicks", "main.swift")])
+        out = subprocess.run([harness, TONES, SCRIPT], capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("ok dual audio off", out.stdout)
 
 
 if __name__ == "__main__":

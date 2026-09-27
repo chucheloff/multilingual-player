@@ -30,9 +30,30 @@ shift $((OPTIND - 1))
 command -v mpv >/dev/null || { echo "dualplay: mpv not found - brew install mpv" >&2; exit 1; }
 
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+scripts="${MPV_HOME:-$HOME/.config/mpv}/scripts"
 args=()
 # Skip --script if the plugin is already installed, or mpv would load it twice.
-[ -e "${MPV_HOME:-$HOME/.config/mpv}/scripts/dual_audio.lua" ] || args+=(--script="$here/scripts/dual_audio.lua")
+[ -e "$scripts/dual_audio.lua" ] || args+=(--script="$here/scripts/dual_audio.lua")
+
+# The bubbaTV menu is a native mpv plugin, compiled on first use against the
+# headers of this mpv. Without swiftc or the headers mpv plays without it.
+menu="$here/tools/.build/bubbatv.so"
+build_menu() {
+  local header
+  header="$(dirname "$(dirname "$(readlink -f "$(command -v mpv)")")")/include/mpv/client.h"
+  if ! command -v swiftc >/dev/null || [ ! -e "$header" ]; then
+    echo "dualplay: no swiftc or mpv headers, so no bubbaTV menu" >&2
+    return 1
+  fi
+  mkdir -p "$here/tools/.build"
+  swiftc -O -emit-library -o "$menu" "$here/tools/bubbatv-menu.swift" -import-objc-header "$header" \
+    -Xlinker -undefined -Xlinker dynamic_lookup
+}
+if [ ! -e "$scripts/bubbatv.so" ]; then
+  if { [ -e "$menu" ] && [ ! "$here/tools/bubbatv-menu.swift" -nt "$menu" ]; } || build_menu; then
+    args+=(--script="$menu")
+  fi
+fi
 # -append takes a single pair, so commas in the language lists survive.
 args+=(--script-opts-append=dual_audio-auto=yes)
 [ -z "$left" ] || args+=(--script-opts-append="dual_audio-left_lang=$left")
