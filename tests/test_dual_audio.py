@@ -306,6 +306,18 @@ class Playing(unittest.TestCase):
     def af_has(self, *parts):
         self.mpv.wait_for(lambda: all(p in af_graph(self.mpv) for p in parts))
 
+    def lands(self, pos):
+        """Wait until playback (paused) is at `pos` with the seek over: while a
+        seek goes on, time-pos already shows where it was asked to go, and a
+        keyframe seek then ends up elsewhere."""
+        def at():
+            return abs((self.mpv.get("time-pos") or 0) - pos) < 0.05
+        self.mpv.wait_for(lambda: at() and not self.mpv.get("seeking") and at())
+
+    def seek_key(self, key, pos):
+        self.mpv.command("keypress", key)
+        self.lands(pos)
+
 
 class Keys(Playing):
     """Key bindings while playing. Paused at 3.0s so any position jump shows up.
@@ -604,6 +616,68 @@ class Keys(Playing):
         self.assertEqual(self.mpv.get("af")[1:], own)
         self.press("a", None)
         self.assertEqual(self.mpv.get("af"), own)
+
+    def test_seek_keys(self):
+        # Left / Right seek exactly 5 s: from 3.0 to 8.0 and back, where mpv's
+        # own arrow seeks go to the sample's keyframes, 10 and 0. Shift+Right /
+        # Left stay mpv's exact 1 s.
+        self.seek_key("RIGHT", 8)
+        self.seek_key("LEFT", 3)
+        self.seek_key("Shift+RIGHT", 4)
+        self.seek_key("Shift+LEFT", 3)
+        # The same with the graph installed, which stays as it is, and a
+        # negative delay, whose shift moves the sound's timestamps (in the
+        # --af filter once a seek rebuilds it); and the bindings the menu's
+        # Back / Forward run.
+        self.press("a", (1, 2))
+        self.message("set-delay", 2, -200)
+        self.wait_sides([(0, 0), (0, -200)])
+        graph = self.mpv.get("lavfi-complex")
+        self.seek_key("RIGHT", 8)
+        self.af_has("asetpts@dual_audio=PTS-0.2/TB")
+        self.seek_key("LEFT", 3)
+        self.mpv.command("script-binding", "dual_audio/seek-forward")
+        self.lands(8)
+        self.mpv.command("script-binding", "dual_audio/seek-back")
+        self.lands(3)
+        self.assertEqual(self.mpv.get("lavfi-complex"), graph)
+        self.assertEqual(self.state()["seek_step"], 5)
+        # ... and the sound goes on from there in step with the picture.
+        self.seek_key("RIGHT", 8)
+        self.mpv.command("set_property", "pause", False)
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") > 10.5)
+        self.assertLess(abs(self.mpv.get("avsync")), 0.1)
+
+    def test_seek_key_held(self):
+        # Held down, Left goes on seeking back, as mpv's arrow keys do.
+        self.mpv.command("seek", 18, "absolute")
+        self.lands(18)
+        self.mpv.command("keydown", "LEFT")
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") < 12)
+        self.mpv.command("keyup", "LEFT")
+
+    def test_seek_step(self):
+        self.restart("--script-opts-append=dual_audio-seek_step=10")
+        self.seek_key("RIGHT", 13)
+        self.seek_key("LEFT", 3)
+        self.mpv.command("script-binding", "dual_audio/seek-forward")
+        self.lands(13)
+        self.assertEqual(self.state()["seek_step"], 10)  # for the menu
+
+    def test_mpv_arrow_keys(self):
+        # seek_keys=no leaves mpv's own arrow seeks on Left / Right (to the
+        # next keyframe); the menu's Back / Forward still seek exactly.
+        self.restart("--script-opts-append=dual_audio-seek_keys=no")
+        self.seek_key("RIGHT", 10)
+        self.mpv.command("script-binding", "dual_audio/seek-back")
+        self.lands(5)
+        # An input.conf line for one wins over the script's, as for the other keys.
+        conf = os.path.join(self.tmp.name, "input.conf")
+        with open(conf, "w") as f:
+            f.write("RIGHT seek 5\n")
+        self.restart("--input-conf=" + conf)
+        self.seek_key("RIGHT", 10)
+        self.seek_key("LEFT", 5)  # still the script's
 
 
 class Live(unittest.TestCase):
@@ -1274,6 +1348,27 @@ class Menu(unittest.TestCase):
         calibrate(self.mpv, False)
         self.wait_menu("---\nCalibrate delay…\nSwap pairs")
 
+    def test_seek_items(self):
+        # Back / Forward come last, with dual audio off too.
+        playback = "---\nPlayback\nBack 5 s\nForward 5 s"
+        self.mpv.wait_for(lambda: self.menu() == "Dual audio\n" + playback)
+        self.mpv.command("keypress", "a")
+        self.wait_menu("Swap pairs\nSubtitles follow pairs\n" + playback)
+        self.assertTrue(self.menu().endswith("Subtitles follow pairs\n" + playback))
+        # Only while a file is loaded.
+        self.mpv.close()
+        self.mpv = Mpv(self.tmp.name, "--script=" + self.plugin, "--idle=yes", src=None)
+        self.mpv.wait_for(lambda: self.menu() == "Dual audio")
+        self.mpv.command("loadfile", TONES)
+        self.mpv.wait_for(lambda: self.menu() == "Dual audio\n" + playback)
+        self.mpv.command("stop")
+        self.mpv.wait_for(lambda: self.menu() == "Dual audio")
+
+    def test_seek_items_step(self):
+        self.mpv.close()
+        self.start("--script-opts-append=dual_audio-seek_step=10")
+        self.wait_menu("Playback\nBack 10 s\nForward 10 s")
+
     def test_follow_subs_item(self):
         self.mpv.command("keypress", "a")
         self.wait_menu("Swap pairs\nSubtitles follow pairs")
@@ -1281,11 +1376,12 @@ class Menu(unittest.TestCase):
         self.wait_menu("Swap pairs\n[x] Subtitles follow pairs")
 
     def test_clicks(self):
-        # Clicks the real menu items and checks the graph.
+        # Clicks the real menu items and checks the graph, and the position
+        # after Back / Forward.
         devices = os.path.join(self.tmp.name, "clicks.json")
         out = subprocess.run([self.harness(), TONES, SCRIPT, devices], capture_output=True, text=True, timeout=60)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertIn("ok dual audio off", out.stdout)
+        self.assertIn("ok forward 5 s with dual audio off", out.stdout)  # the last check
         with open(devices) as f:  # the loudness click, remembered
             self.assertEqual(json.load(f), {"system output (right ear)": {"gain": 1, "delay": 0}})
 

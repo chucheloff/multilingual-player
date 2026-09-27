@@ -4,7 +4,8 @@
 // tests/test_dual_audio.py (Menu.test_clicks, Menu.test_device_clicks):
 //   menu_clicks FILE DUAL_AUDIO_LUA DEVICES_JSON
 //       prints "ok ..." lines; exits 1 on a failure. The script remembers
-//       the loudness set by a click in DEVICES_JSON.
+//       the loudness set by a click in DEVICES_JSON. FILE is tones.mkv, for
+//       Back / Forward: keyframes only at 0 and 10 s show a seek is exact.
 //   menu_clicks FILE DUAL_AUDIO_LUA DEVICES_JSON HELPER LOG
 //       pairs mode as under dualplay -2 ("Pair A", "Pair B"), with HELPER in
 //       place of tools/audio-pairs: moves the pairs to other headphones.
@@ -57,6 +58,13 @@ func sides() -> [[String: Any]] {
     return o?["sides"] as? [[String: Any]] ?? []
 }
 
+/// Paused at `t` with the seek over: while a seek goes on time-pos already
+/// shows where it was asked to go, and a keyframe seek ends up elsewhere.
+func at(_ t: Double) -> Bool {
+    func near() -> Bool { abs((Double(get("time-pos")) ?? -1) - t) < 0.05 }
+    return near() && get("seeking") == "no" && near()
+}
+
 func ui<T>(_ body: @MainActor () -> T) -> T {
     DispatchQueue.main.sync { MainActor.assumeIsolated(body) }
 }
@@ -75,7 +83,7 @@ func wait(_ what: String, _ ok: () -> Bool) {
     let end = Date() + 5
     while !ok() {
         if Date() > end {
-            print("FAIL \(what): lavfi-complex=\(graph())")
+            print("FAIL \(what): lavfi-complex=\(graph()) time-pos=\(get("time-pos"))")
             exit(1)
         }
         Thread.sleep(forTimeInterval: 0.05)
@@ -150,8 +158,16 @@ Thread {
         get("user-data/dual_audio").contains("\"follow_subs\":true")
             && ui { menu().item(withTitle: "Subtitles follow ears")?.state } == .on
     }
+    // Paused at 3.0: Back / Forward land exactly 5 s away, with the graph
+    // installed and without it.
+    ui { click(menu(), "Forward 5 s") }
+    wait("forward 5 s to 8.0") { at(8) }
+    ui { click(menu(), "Back 5 s") }
+    wait("back 5 s to 3.0") { at(3) }
     ui { click(menu(), "Dual audio") }
     wait("dual audio off") { graph().isEmpty }
+    ui { click(menu(), "Forward 5 s") }
+    wait("forward 5 s with dual audio off") { at(8) }
     mpv_terminate_destroy(mpv)
     exit(0)
 }.start()
