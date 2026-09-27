@@ -105,10 +105,10 @@ class Render(unittest.TestCase):
 class Mpv:
     """A real-time mpv instance driven over its JSON IPC socket."""
 
-    def __init__(self, tmpdir, *opts):
+    def __init__(self, tmpdir, *opts, src=TONES):
         self.path = os.path.join(tmpdir, "mpv.sock")
         self.proc = subprocess.Popen(BASE + ["--ao=null", "--input-ipc-server=" + self.path,
-                                             *opts, TONES])
+                                             *opts, src])
         deadline = time.time() + 10
         while not os.path.exists(self.path):
             if time.time() > deadline:
@@ -208,6 +208,42 @@ class Keys(unittest.TestCase):
         self.mpv.command("set_property", "pause", False)
         time.sleep(3)
         self.assertLess(abs(self.mpv.get("avsync")), 0.1)
+
+
+class Subs(unittest.TestCase):
+    """Subtitles keep coming after the audio graph is rebuilt. The cache is kept
+    small so mpv has to go on reading them, as it does with a long movie."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        srt = os.path.join(self.tmp.name, "subs.srt")
+        with open(srt, "w") as f:  # one line per second, no gaps
+            f.write("\n".join("%d\n00:00:%02d,000 --> 00:00:%02d,000\nLine %d\n" % (i + 1, i, i + 1, i)
+                              for i in range(20)))
+        movie = os.path.join(self.tmp.name, "movie.mkv")
+        subprocess.run(["ffmpeg", "-v", "error", "-i", TONES, "-i", srt, "-map", "0", "-map", "1",
+                        "-c", "copy", "-c:s", "srt", movie], check=True)
+        self.mpv = Mpv(self.tmp.name, "--sid=1", "--script-opts=dual_audio-auto=yes",
+                       "--cache=no", "--demuxer-readahead-secs=0.5", "--demuxer-max-bytes=1MiB",
+                       "--demuxer-max-back-bytes=0", src=movie)
+        self.mpv.wait_for(lambda: self.mpv.get("sub-text"))
+
+    def tearDown(self):
+        self.mpv.close()
+        self.tmp.cleanup()
+
+    def assert_subs_keep_coming(self):
+        start = self.mpv.get("time-pos")
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") > start + 2.5)
+        self.assertRegex(self.mpv.get("sub-text"), r"^Line \d+$")
+
+    def test_cycle(self):
+        self.mpv.command("keypress", "}")
+        self.assert_subs_keep_coming()
+
+    def test_toggle_off(self):
+        self.mpv.command("keypress", "a")
+        self.assert_subs_keep_coming()
 
 
 if __name__ == "__main__":
