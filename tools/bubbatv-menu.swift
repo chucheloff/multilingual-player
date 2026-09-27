@@ -1,5 +1,6 @@
 // bubbatv - the "bubbaTV" menu in mpv's menu bar, for scripts/dual_audio.lua:
-// for each headphone pair (or ear) its device, audio track, loudness and delay.
+// for each headphone pair (or ear) its device, audio track, loudness and delay,
+// and whether the subtitles follow the pairs' languages.
 //
 // An mpv C plugin: a library mpv loads with --script=bubbatv.so. dualplay
 // builds and loads it; by hand:
@@ -8,7 +9,8 @@
 //     -Xlinker -undefined -Xlinker dynamic_lookup
 //
 // It shows the state dual_audio.lua keeps in user-data/dual_audio and changes
-// it with `script-message-to dual_audio set-track|set-gain|set-delay SIDE VALUE`.
+// it with `script-message-to dual_audio set-track|set-gain|set-delay SIDE VALUE`
+// and the script's key bindings.
 // The menu as built is mirrored as text in user-data/bubbatv/menu (for tests).
 import Cocoa
 import CoreAudio
@@ -28,7 +30,7 @@ struct Side: Sendable {
 
 /// What dual_audio.lua publishes; `loaded` is false while it hasn't (yet).
 struct State: Sendable {
-    var loaded = false, enabled = false, active = false, pairs = false
+    var loaded = false, enabled = false, active = false, pairs = false, followSubs = false
     var tracks: [Track] = []
     var sides: [Side] = []
 
@@ -41,6 +43,7 @@ struct State: Sendable {
         enabled = o["enabled"] as? Bool ?? false
         active = o["active"] as? Bool ?? false
         pairs = o["mode"] as? String == "pairs"
+        followSubs = o["follow_subs"] as? Bool ?? false
         tracks = (o["tracks"] as? [[String: Any]] ?? []).compactMap { t in
             guard let id = t["id"] as? Int else { return nil }
             return Track(id: id, title: t["title"] as? String ?? "[\(id)]")
@@ -245,6 +248,9 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
         if state.active {
             menu.addItem(.separator())
             menu.addItem(item(state.pairs ? "Swap pairs" : "Swap ears", #selector(swap)))
+            let subs = item(state.pairs ? "Subtitles follow pairs" : "Subtitles follow ears", #selector(followSubs))
+            subs.state = state.followSubs ? .on : .off
+            menu.addItem(subs)
         }
         mirror()
     }
@@ -290,6 +296,7 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
 
     @objc private func toggle() { mpv.command("script-binding", "dual_audio/toggle") }
     @objc private func swap() { mpv.command("script-binding", "dual_audio/swap") }
+    @objc private func followSubs() { mpv.command("script-binding", "dual_audio/follow-subs") }
 
     @objc private func pick(_ sender: NSMenuItem) {
         guard let v = sender.representedObject as? [Int] else { return }

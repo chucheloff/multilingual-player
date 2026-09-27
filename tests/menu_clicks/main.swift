@@ -77,6 +77,11 @@ Thread {
         rows[2].subviews.compactMap { $0 as? NSButton }.first { $0.title == "+" }!.performClick(nil)
     }
     wait("right loudness + after the pause") { graph().contains("volume=1dB[r]") }
+    ui { click(menu(), "Subtitles follow ears") }
+    wait("subtitles follow the ears") {
+        get("user-data/dual_audio").contains("\"follow_subs\":true")
+            && ui { menu().item(withTitle: "Subtitles follow ears")?.state } == .on
+    }
     ui { click(menu(), "Dual audio") }
     wait("dual audio off") { graph().isEmpty }
     mpv_terminate_destroy(mpv)

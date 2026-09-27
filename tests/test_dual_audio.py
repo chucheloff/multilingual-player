@@ -24,6 +24,13 @@ TONES = os.path.join(ROOT, "samples", "tones.mkv")  # 1=eng 440Hz, 2=rus 1000Hz 
 BASE = ["mpv", "--no-config", "--script=" + SCRIPT, "--vo=null", "--really-quiet"]
 
 
+def srt(path, word):
+    """A subtitle file with one line per second, no gaps: "<word> N" from N s."""
+    with open(path, "w") as f:
+        f.write("\n".join("%d\n00:00:%02d,000 --> 00:00:%02d,000\n%s %d\n" % (i + 1, i, i + 1, word, i)
+                          for i in range(20)))
+
+
 class Render(unittest.TestCase):
     """Render 3s of playback to a WAV and inspect the channels."""
 
@@ -156,32 +163,32 @@ class Mpv:
         self.sock.close()
 
 
-class Keys(unittest.TestCase):
-    """Key bindings while playing. Paused at 3.0s so any position jump shows up.
-    The playlist holds the sample twice, standing in for two episodes."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.mpv = Mpv(self.tmp.name, "--start=3", "--pause", TONES)
-        self.mpv.wait_for(lambda: self.mpv.get("time-pos") is not None)
-
-    def tearDown(self):
-        self.mpv.close()
-        self.tmp.cleanup()
+class Playing(unittest.TestCase):
+    """Helpers for driving self.mpv, paused at 3.0s (--start=3 --pause) with
+    a playlist of two files."""
 
     def press(self, key, expect):
         self.mpv.command("keypress", key)
         self.expect(expect)
 
     def expect(self, expect):
-        """Wait until the graph routes aid L / aid R (None = off) at 3.0s."""
+        """Wait until the graph routes aid L / aid R (None = off) at 3.0s, and
+        the script has published it: the last thing it does for a change, so
+        the subtitles are set by then too."""
         def routed():
             g = self.mpv.get("lavfi-complex")
             if expect is None:
                 return g == ""
             ids = [int(i) for i in re.findall(r"\[aid(\d+)\]", g)]
             return (ids * 2)[:2] == list(expect)  # a track both sides play appears once
+
+        def published():
+            s = self.state()
+            if expect is None:
+                return not s["active"]
+            return s["active"] and [side.get("track") for side in s["sides"]] == list(expect)
         self.mpv.wait_for(routed)
+        self.mpv.wait_for(published)
         self.mpv.wait_for(lambda: abs((self.mpv.get("time-pos") or 0) - 3.0) < 0.05)
 
     def next_file(self):
@@ -197,6 +204,20 @@ class Keys(unittest.TestCase):
 
     def state(self):
         return self.mpv.get("user-data/dual_audio")
+
+
+class Keys(Playing):
+    """Key bindings while playing. Paused at 3.0s so any position jump shows up.
+    The playlist holds the sample twice, standing in for two episodes."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.mpv = Mpv(self.tmp.name, "--start=3", "--pause", TONES)
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") is not None)
+
+    def tearDown(self):
+        self.mpv.close()
+        self.tmp.cleanup()
 
     def test_toggle_cycle_swap(self):
         self.press("a", (1, 2))     # on: current track left, next right
@@ -288,12 +309,10 @@ class Subs(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        srt = os.path.join(self.tmp.name, "subs.srt")
-        with open(srt, "w") as f:  # one line per second, no gaps
-            f.write("\n".join("%d\n00:00:%02d,000 --> 00:00:%02d,000\nLine %d\n" % (i + 1, i, i + 1, i)
-                              for i in range(20)))
+        subs = os.path.join(self.tmp.name, "subs.srt")
+        srt(subs, "Line")
         movie = os.path.join(self.tmp.name, "movie.mkv")
-        subprocess.run(["ffmpeg", "-v", "error", "-i", TONES, "-i", srt, "-map", "0", "-map", "1",
+        subprocess.run(["ffmpeg", "-v", "error", "-i", TONES, "-i", subs, "-map", "0", "-map", "1",
                         "-c", "copy", "-c:s", "srt", movie], check=True)
         self.mpv = Mpv(self.tmp.name, "--sid=1", "--script-opts=dual_audio-auto=yes",
                        "--cache=no", "--demuxer-readahead-secs=0.5", "--demuxer-max-bytes=1MiB",
@@ -316,6 +335,130 @@ class Subs(unittest.TestCase):
     def test_toggle_off(self):
         self.mpv.command("keypress", "a")
         self.assert_subs_keep_coming()
+
+
+FOLLOW = "--script-opts-append=dual_audio-follow_subs=yes"
+
+
+class FollowSubs(Playing):
+    """Subtitles that follow the pairs. The movie has forced English, Russian
+    and English subtitles; the next file only Russian and English, in other
+    slots. Line N of a track says "<word> N", so at 3.0s the full English
+    track shows "Eng 3" and the forced one "Forced 3"."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.movie = self.make("movie.mkv", ("eng", "Forced"), ("rus", "Rus"), ("eng", "Eng"))
+        self.next = self.make("next.mkv", ("rus", "Rus"), ("eng", "Eng"))
+        self.mpv = None
+
+    def tearDown(self):
+        if self.mpv:
+            self.mpv.close()
+        self.tmp.cleanup()
+
+    def make(self, name, *subs):
+        """The tones plus subtitle tracks (language, word); word "Forced" marks one forced."""
+        cmd, tags = ["ffmpeg", "-v", "error", "-i", TONES], []
+        for i, (lang, word) in enumerate(subs):
+            path = os.path.join(self.tmp.name, "%s.%d.srt" % (name, i))
+            srt(path, word)
+            cmd += ["-i", path]
+            tags += ["-map", str(i + 1), "-metadata:s:s:%d" % i, "language=" + lang,
+                     "-disposition:s:%d" % i, "forced" if word == "Forced" else "0"]
+        out = os.path.join(self.tmp.name, name)
+        subprocess.run(cmd + ["-map", "0", *tags, "-c", "copy", "-c:s", "srt", out], check=True)
+        return out
+
+    def start(self, *opts):
+        self.mpv = Mpv(self.tmp.name, "--start=3", "--pause", "--script-opts-append=dual_audio-auto=yes",
+                       *opts, self.movie, src=self.next)
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") is not None)
+
+    def shows(self, main, top):
+        """Wait for these lines at 3.0s: the main subtitles (bottom), then the
+        secondary ones (top); None = no line."""
+        want = [main and main + " 3", top and top + " 3"]
+        self.mpv.wait_for(lambda: [self.mpv.get("sub-text"), self.mpv.get("secondary-sub-text")] == want)
+
+    def ids(self):
+        return [self.mpv.get("sid"), self.mpv.get("secondary-sid")]
+
+    def test_off_by_default(self):
+        self.start("--sid=2")
+        self.shows("Rus", None)
+        self.press("}", (1, 3))
+        self.shows("Rus", None)
+        self.assertFalse(self.state()["follow_subs"])
+
+    def test_track_changes_and_swap(self):
+        self.start(FOLLOW)
+        self.expect((1, 2))
+        self.shows("Eng", "Rus")    # the full English track, not the forced one
+        self.assertEqual(self.ids(), [3, 2])
+        self.press("}", (1, 3))
+        self.shows("Eng", None)     # no German subtitles: the top stays empty
+        self.press("{", (2, 3))
+        self.shows("Rus", None)
+        self.press("y", (3, 2))
+        self.shows(None, "Rus")     # ... and so does the bottom
+        self.message("set-track", 1, 2)
+        self.expect((2, 2))
+        self.shows("Rus", None)     # both hear Russian: one line is enough
+        self.assertTrue(self.state()["follow_subs"])
+
+    def test_next_file(self):
+        self.start(FOLLOW)
+        self.press("y", (2, 1))
+        self.shows("Rus", "Eng")
+        self.next_file()
+        self.expect((2, 1))
+        self.shows("Rus", "Eng")
+        self.assertEqual(self.ids(), [1, 2])  # found by language, not by id
+
+    def test_own_pick_stops_following(self):
+        self.start(FOLLOW)
+        self.shows("Eng", "Rus")
+        self.mpv.command("keypress", "v")      # hiding them is no pick
+        self.mpv.command("keypress", "Alt+v")
+        self.press("}", (1, 3))
+        self.assertEqual(self.ids(), [3, False])
+        self.mpv.command("keypress", "j")      # mpv's next subtitle track: a pick
+        self.mpv.wait_for(lambda: not self.state()["follow_subs"])
+        picked = self.ids()
+        self.press("{", (2, 3))
+        self.press("y", (3, 2))
+        self.assertEqual(self.ids(), picked)
+
+    def test_switch_off_and_dual_audio_off(self):
+        # Either way the top line goes, and the bottom one stays: the first
+        # pair's language is what plays with dual audio off.
+        self.start(FOLLOW)
+        self.shows("Eng", "Rus")
+        self.mpv.command("script-binding", "dual_audio/follow-subs")
+        self.shows("Eng", None)
+        self.assertFalse(self.state()["follow_subs"])
+        self.mpv.command("script-binding", "dual_audio/follow-subs")
+        self.shows("Eng", "Rus")
+        self.expect((1, 2))         # still at 3.0s
+        self.press("a", None)
+        self.shows("Eng", None)
+        self.press("a", (1, 2))
+        self.shows("Eng", "Rus")
+
+    def test_keep_coming_after_graph_change(self):
+        # A loudness change rebuilds the graph but keeps the tracks: both
+        # subtitles must be selected anew all the same (see Subs).
+        self.start(FOLLOW, "--cache=no", "--demuxer-readahead-secs=0.5", "--demuxer-max-bytes=1MiB",
+                   "--demuxer-max-back-bytes=0")
+        self.shows("Eng", "Rus")
+        self.mpv.command("set_property", "pause", False)
+        self.message("set-gain", 1, -3)
+        self.mpv.wait_for(lambda: "volume=-3dB[l]" in self.mpv.get("lavfi-complex"))
+        start = self.mpv.get("time-pos")
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") > start + 2.5, timeout=15)
+        self.assertRegex(self.mpv.get("sub-text"), r"^Eng \d+$")
+        self.assertRegex(self.mpv.get("secondary-sub-text"), r"^Rus \d+$")
 
 
 class Menu(unittest.TestCase):
@@ -375,6 +518,12 @@ class Menu(unittest.TestCase):
                        "  [x] [1] English 440Hz (eng)\n  [2] Russian 1000Hz 5.1 (rus)\n"
                        "  [3] German 2500Hz (ger)\nLoudness -6 dB\nDelay 0 ms")
         self.assertIn("Loudness 0 dB\nDelay +120 ms", self.menu())
+
+    def test_follow_subs_item(self):
+        self.mpv.command("keypress", "a")
+        self.wait_menu("Swap pairs\nSubtitles follow pairs")
+        self.mpv.command("script-binding", "dual_audio/follow-subs")
+        self.wait_menu("Swap pairs\n[x] Subtitles follow pairs")
 
     def test_clicks(self):
         # Built against libmpv: clicks the real menu items and checks the graph.

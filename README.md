@@ -7,7 +7,7 @@ Watch a movie with a friend in two languages at once, on one Mac:
 
 It's a plugin for [mpv](https://mpv.io) (`scripts/dual_audio.lua`) plus a
 small launcher (`dualplay`), with a **bubbaTV** menu in mpv's menu bar for
-each pair's track, loudness and delay.
+each pair's track, loudness and delay, and subtitles in both languages.
 
 ## Quick start
 
@@ -54,7 +54,8 @@ dual audio on it has a group per pair (or ear):
 - **Loudness** — −30 … +6 dB, on top of mpv's volume
 - **Delay** — −1000 … +1000 ms, on top of mpv's audio delay (`Ctrl+-` / `Ctrl++`)
 
-plus switches for dual audio on/off and swapping the pairs. The sliders apply
+plus switches for dual audio on/off, swapping the pairs and
+**Subtitles follow pairs** (below). The sliders apply
 a moment after you let go (each change briefly restarts the sound); click a
 value to reset it to 0.
 
@@ -64,6 +65,28 @@ installed mpv; without `swiftc`, mpv plays as before, just without the menu.
 The script takes the same settings from anywhere:
 `script-message-to dual_audio set-track|set-gain|set-delay SIDE VALUE`
 (SIDE 1 = left ear / first pair, 2 = the other; dB, ms).
+
+## Subtitles in both languages
+
+Tick **Subtitles follow pairs** in the bubbaTV menu (with one shared pair:
+**Subtitles follow ears**) and each pair gets subtitles in the language it
+hears: the first pair's at the bottom (mpv's main subtitles), the second
+pair's at the top (mpv's secondary subtitles). They change along with the
+pairs' tracks — `{` / `}`, `y`, the menu — and carry on into the next file.
+To have it on from the start, put `follow_subs=yes` in `dual_audio.conf`
+(below) or add `--script-opts-append=dual_audio-follow_subs=yes` after the
+file name.
+
+- A language without subtitles leaves its line empty; the other line stays in its place.
+- Both pairs hear the same language: one line, at the bottom.
+- Full subtitles come before forced ones (those only translate the bits said in another language).
+- Pick subtitles yourself (`j` / `J`, mpv's menus) and they stop following:
+  yours stay, and the menu item unticks. Tick it again to go back.
+  Hiding them (`v` bottom, `Alt+v` top) is not a pick.
+- Unticking it, or dual audio off, removes the top line and keeps the bottom
+  one: the first pair's language is what plays with dual audio off.
+- The top line is plain text (mpv drops its styling), and picture subtitles
+  (PGS, VobSub) can't move up there, so as a second line they overlap the first.
 
 ## Keys
 
@@ -81,6 +104,8 @@ speed by −/+10% and Backspace resets it.
 
 Rebind in `~/.config/mpv/input.conf`, e.g. `Ctrl+d script-binding dual_audio/toggle`
 (names: `toggle`, `cycle-left`, `cycle-right`, `swap`, `balance-left`, `balance-right`).
+Subtitles follow pairs has no key of its own: `Alt+j script-binding dual_audio/follow-subs`
+gives it one.
 Lines there win over the plugin's keys, so `{ multiply speed 0.5` and
 `} multiply speed 2.0` bring the speed keys back.
 
@@ -103,6 +128,8 @@ auto=yes
 left_lang=eng,en
 right_lang=rus,ru
 balance_step=2
+# subtitles in both pairs' languages
+follow_subs=yes
 ```
 
 ## Good to know
@@ -112,7 +139,8 @@ balance_step=2
 - **With one shared pair, each ear gets a mono downmix** of its track. For 5.1 tracks the centre
   channel (dialogue) keeps its full level, so a stereo and a 5.1 track sound
   about equally loud. If one is quieter, use `h` / `k`.
-- Video, subtitles and seeking are untouched: the graph only handles audio.
+- Video and seeking are untouched, and so are the subtitles unless they
+  follow the pairs: the graph only handles audio.
 
 ## How it works
 
@@ -155,7 +183,8 @@ python3 tests/test_dual_audio.py
 
 Generates `samples/` (via `tools/make-samples.sh`): `tones.mkv` has a
 distinct sine tone per track, and the tests play it through mpv and check which
-tone lands in which channel, including key presses sent over mpv's IPC socket.
+tone lands in which channel, including key presses sent over mpv's IPC socket,
+and which subtitle lines show for which pair.
 With `swiftc` they also build the bubbaTV menu, load it into mpv and click
 through it (`tests/menu_clicks/`).
 For listening: `samples/speech.mkv` (English and Russian speech) and
