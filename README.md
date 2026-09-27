@@ -8,8 +8,9 @@ Watch a movie with a friend in two languages at once, on one Mac:
 It's a plugin for [mpv](https://mpv.io) (`scripts/dual_audio.lua`) plus a
 small launcher (`dualplay`), with a **bubbaTV** menu in mpv's menu bar for
 each pair's headphones, track, loudness and delay, and subtitles in both
-languages. Loudness and delay are remembered per headphones. The **bubbaTV**
-app starts a movie without the terminal.
+languages. Loudness and delay are remembered per headphones, and a sync
+pattern helps set the delays. The **bubbaTV** app starts a movie without the
+terminal.
 
 ## Quick start
 
@@ -85,7 +86,8 @@ Volume: `9` / `0` changes both, `h` / `k` makes one pair quieter than the other,
 and the bubbaTV menu sets each pair's loudness on its own.
 If speech lags the picture, `Ctrl+-` plays the audio 100 ms earlier (`Ctrl++` later);
 if only one pair lags (Bluetooth headphones differ), give that pair a negative delay
-in the bubbaTV menu. `samples/sync.mkv` flashes and beeps once a second to check this.
+in the bubbaTV menu: **Calibrate delay…** there flashes and beeps once a second to set
+it by ([below](#calibrating-the-delays)).
 Both are remembered for those headphones, so you set them once
 ([below](#remembered-per-headphones)).
 
@@ -100,7 +102,8 @@ dual audio on it has a group per pair (or ear):
 - **Loudness** — −30 … +6 dB, on top of mpv's volume
 - **Delay** — −1000 … +1000 ms, on top of mpv's audio delay (`Ctrl+-` / `Ctrl++`)
 
-plus switches for dual audio on/off, swapping the pairs and
+plus switches for dual audio on/off, **Calibrate delay…**
+([below](#calibrating-the-delays)), swapping the pairs and
 **Subtitles follow pairs** (below). Loudness and delay change as you drag,
 without restarting the sound, so you can tune them by ear while the movie
 plays: a delay change makes that pair skip or pause for the difference, and
@@ -116,6 +119,38 @@ The script takes the same settings from anywhere:
 (SIDE 1 = left ear / first pair, 2 = the other; dB, ms), and with `-2`
 `set-device SIDE NAME` (the output's full name, as the menu lists it). The menu
 reports the connected outputs to the script with `outputs NAME...`.
+
+## Calibrating the delays
+
+Bluetooth headphones play late, some more than others. mpv makes up for the
+latency macOS reports, but that isn't always right, and with two pairs on one
+combined device it is one figure for both. To line each pair up with the
+picture:
+
+1. Choose **Calibrate delay…** in the bubbaTV menu. The movie makes way for a
+   sync pattern: the screen flashes white and both pairs beep at the same
+   moment, once a second.
+2. Each of you moves your own pair's **Delay** in the menu until your beep
+   lands on the flash: if it comes after the flash, lower the delay (below 0
+   plays that pair earlier); if before, raise it.
+3. Choose **Done calibrating**. The movie is back where it was, paused or
+   playing as before, with the same tracks and subtitles and the new delays,
+   [remembered](#remembered-per-headphones) for those headphones.
+
+- The beep goes through each pair's delay and loudness just as the movie's
+  sound does, so what lines up here lines up in the movie. mpv's own audio
+  delay (`Ctrl+-` / `Ctrl++`) moves both beeps.
+- With one shared pair, each ear beeps, and each ear's delay is set the same way.
+- mpv makes the pattern itself, so it needs no extra file. It has the
+  movie's size, so the window stays as it is. Subtitles are hidden meanwhile.
+- Picking a track, swapping, dual audio off and the next file end it too,
+  the same way. Seeking moves the pattern along; Done still goes back to
+  where you were.
+- Headphones that drop out meanwhile keep the movie paused after Done.
+- It has no key of its own: `Alt+c script-binding dual_audio/calibrate` in
+  `input.conf` gives it one (press it again for Done).
+- Quit after Done, not while calibrating: `Shift+Q` would save the pattern's
+  position, and the hidden subtitles, for the next start.
 
 ## Subtitles in both languages
 
@@ -271,6 +306,14 @@ One mpv quirk is worked around: changing the graph during playback (a track
 switch, dual audio on/off) makes mpv jump to the next keyframe (up to ~10 s
 ahead), so the plugin drops mpv's buffers and seeks back to the exact position.
 
+Calibrating puts a graph of generated sources in `--lavfi-complex` instead
+of the tracks: `color` with a `drawbox` for the flash as `[vo]`, `aevalsrc`
+for the beep (on every channel) as `[ao]`, both on for 0.1 s at the same
+whole seconds, and `setpts` / `asetpts` moving them to where the movie was.
+The beep then goes through the same `@dual_audio` filter as the movie's
+sound, so its delays apply exactly as in the movie. Done installs the
+movie's graph again, selects the video track, and seeks back.
+
 ## Tests
 
 ```sh
@@ -283,8 +326,10 @@ tone lands in which channel, including key presses sent over mpv's IPC socket,
 and which subtitle lines show for which pair. `sync.mkv` beeps once a second
 on both tracks: the tests check when each ear's beeps arrive, change a delay
 or loudness during playback and measure when and how loud each channel's
-beeps come out, and that nothing seeks. Remembered settings and watch-later
-files go to temp dirs.
+beeps come out, and that nothing seeks. They also calibrate, measuring
+when each channel beeps against when the picture flashes (brightness logged
+by a `--vf` filter), and check what Done puts back. Remembered settings and
+watch-later files go to temp dirs.
 With `swiftc` they also build the bubbaTV menu, load it into mpv and click
 through it (`tests/menu_clicks/`). They build bubbaTV.app too and check the
 command its `--dry-run` prints.

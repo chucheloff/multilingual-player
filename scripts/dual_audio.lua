@@ -26,6 +26,11 @@
 -- which has no key of its own): the first side's language as the main
 -- subtitles, the other side's as mpv's secondary ones (at the top).
 --
+-- The calibrate binding (no key of its own either; "Calibrate delay..." in
+-- the menu) plays a sync pattern in place of the movie - a flash and a beep
+-- once a second - while each side's delay is set by ear. The binding again
+-- (Done) brings the movie back where it was.
+--
 -- Under dualplay -2 (the helper option set), `set-device SIDE NAME` moves a
 -- pair to other headphones, and the menu reports the connected outputs with
 -- `outputs NAME...`: headphones that drop out pause the movie, and once they
@@ -73,8 +78,10 @@ local ours = false      -- lavfi-complex currently holds our graph
 local pref = { left = opts.left_lang, right = opts.right_lang }
 local follow = opts.follow_subs
 local sub_props = { "sid", "secondary-sid" }  -- the first side's subtitles, then the other's
+local sub_shown = { "sub-visibility", "secondary-sub-visibility" }  -- both slots; hidden while calibrating
 local subs_set          -- the subtitle ids we selected while following, by slot; nil otherwise
 local loading = true    -- a file is loading: mpv picks its own subtitles until on_preloaded
+local calib             -- while calibrating: where the pattern starts and what to put back (see calibrate)
 
 local function tracks_of(kind)
     local list = {}
@@ -339,7 +346,7 @@ local function publish()
     end
     mp.set_property_native("user-data/dual_audio", {
         enabled = enabled, active = ours, mode = opts.mode, tracks = list, sides = sides,
-        follow_subs = follow, switch_devices = can_combine(),
+        follow_subs = follow, switch_devices = can_combine(), calibrating = calib ~= nil,
     })
 end
 
@@ -400,6 +407,8 @@ local function subs_changed()
     end
 end
 
+local hint = mp.create_osd_overlay("ass-events")  -- on screen while calibrating
+
 -- Installs or removes the graph. `live` means playback is under way: mpv
 -- then re-reads the file for the newly selected tracks, and its refresh seek
 -- can land on the next keyframe (up to ~10s ahead). A seek of our own issued
@@ -408,12 +417,15 @@ end
 local function apply(live)
     local tracks = audio_tracks()
     local want = enabled and #tracks >= 2
+    -- A new graph ends calibrating: the movie comes back as it was then.
+    local back = calib
+    calib = nil
     if not want and not ours then
         set_af(false)  -- there may be one from a watch-later file
         return publish()
     end
     if want and not (by_id(tracks, left) and by_id(tracks, right)) then pick(tracks) end
-    local pos = live and mp.get_property_number("time-pos")
+    local pos = live and (back and back.pos or mp.get_property_number("time-pos"))
     -- Our --af filter goes in after the graph and out before it, so it only
     -- ever gets the joined channels.
     if not want then set_af(false) end
@@ -422,11 +434,19 @@ local function apply(live)
     ours = want
     -- Back to normal playback: keep the left-ear / first-pair language.
     if not want and left then mp.set_property_number("aid", left) end
+    if back then
+        -- The pattern had the picture's place (a new file picks its own).
+        if live and back.vid then mp.set_property_number("vid", back.vid) end
+        for i, prop in ipairs(sub_shown) do mp.set_property_native(prop, back.shown[i]) end
+        hint:remove()
+    end
     update_subs(live)
     if pos then
         mp.commandv("drop-buffers")
         mp.commandv("seek", pos, "absolute+exact")
     end
+    -- Headphones that dropped out meanwhile keep the movie paused.
+    if back then mp.set_property_bool("pause", back.pause or next(lost) ~= nil) end
     publish()
 end
 
@@ -515,6 +535,62 @@ local function toggle_follow()
     update_subs(false)
     publish()
     mp.osd_message(string.format("Subtitles follow the %s: %s", sides_word, follow and "on" or "off"), 3)
+end
+
+-- The sync pattern: a white flash and a beep on every channel (1 kHz at
+-- -20 dBFS, like a film's sync pop), together for 0.1 s each second,
+-- generated in the graph instead of read from the file. The beep goes
+-- through our --af filter like the movie's sound, so each side hears it as
+-- late as it hears the movie. The sources start at 0; setpts moves them to
+-- calib.from, the whole second (exact in both time bases) where calibrating
+-- started or a seek landed, so the position goes on from there. The picture
+-- has the movie's size, so the window keeps its own.
+local function pattern()
+    local on = "lt(mod(t,1),0.1)"
+    return string.format("color=black:s=%dx%d:r=25,drawbox=c=white:t=fill:enable='%s',setpts=PTS+%d/TB[vo];"
+        .. "aevalsrc=exprs='0.1*sin(2*PI*1000*t)*%s':s=48000:c=%s,asetpts=PTS+%d/TB[ao]",
+        calib.w, calib.h, on, calib.from, on, pairs_mode and "quad" or "stereo", calib.from)
+end
+
+-- Calibrate delay... in the menu: the pattern plays, unpaused, while each
+-- side's delay is set by ear, live as during the movie. The movie's
+-- subtitles would go on meanwhile, so they are hidden. Done (the binding
+-- again) puts back the graph, picture, subtitles, position and pause (see
+-- apply), and the delays stay, remembered for the headphones as always.
+local function calibrate()
+    if calib then return apply(true) end
+    if not ours then return show() end
+    local pos = mp.get_property_number("time-pos")
+    local w, h = mp.get_property_number("video-params/dw"), mp.get_property_number("video-params/dh")
+    if not (pos and w and h) then return say("Delay calibration needs a video track", 4) end
+    calib = { pos = pos, from = math.floor(pos), w = w, h = h, pause = mp.get_property_bool("pause"),
+              vid = mp.get_property_number("current-tracks/video/id"), shown = {} }
+    for i, prop in ipairs(sub_shown) do
+        calib.shown[i] = mp.get_property_native(prop)
+        mp.set_property_bool(prop, false)
+    end
+    mp.set_property("lavfi-complex", pattern())
+    set_af(true)  -- with the live values: the sound breaks here anyway
+    mp.set_property_bool("pause", false)
+    hint.data = string.format("{\\an2\\fs28}Set each %s's Delay in the bubbaTV menu until its beep lands on "
+        .. "the flash,\\Nthen choose Done calibrating.", sides_word:sub(1, -2))
+    hint:update()
+    msg.info("Calibrating the delays")
+    publish()
+end
+
+-- mpv builds the graph anew on a seek, so the pattern would start over from
+-- calib.from: generated and dropped all the way to where a seek forward
+-- lands (half a minute for 25 minutes of a 1080p movie), and a seek back
+-- would land on calib.from. Start it where the seek lands instead. (Should
+-- mpv be playing again by the time this reads the position, a seek back
+-- just goes on from calib.from.)
+local function follow_seek()
+    local pos = calib and mp.get_property_number("time-pos")
+    if pos and math.floor(pos) ~= calib.from then
+        calib.from = math.floor(pos)
+        mp.set_property("lavfi-complex", pattern())
+    end
 end
 
 -- set-track / set-gain / set-delay SIDE VALUE, from the bubbaTV menu.
@@ -652,6 +728,7 @@ local function catch_up()
     if ours then set_af(true) end
 end
 mp.register_event("seek", catch_up)
+mp.register_event("seek", follow_seek)
 mp.register_event("audio-reconfig", catch_up)
 
 -- Pairs mode on an ordinary stereo device folds channels 3-4 into 1-2, so
@@ -674,3 +751,4 @@ mp.add_key_binding("y", "swap", swap)
 mp.add_key_binding("h", "balance-left", function() nudge(1) end)
 mp.add_key_binding("k", "balance-right", function() nudge(2) end)
 mp.add_key_binding(nil, "follow-subs", toggle_follow)
+mp.add_key_binding(nil, "calibrate", calibrate)

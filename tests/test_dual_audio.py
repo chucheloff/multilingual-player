@@ -726,6 +726,175 @@ class Live(unittest.TestCase):
         self.assertAlmostEqual(right / left, 10 ** (-6 / 20), delta=0.01)
 
 
+def calibrate(mpv, on=True):
+    """Calibrate delay... (on) or Done (off), as the bubbaTV menu does it."""
+    mpv.command("script-binding", "dual_audio/calibrate")
+    mpv.wait_for(lambda: mpv.get("user-data/dual_audio")["calibrating"] == on)
+
+
+class Pattern(unittest.TestCase):
+    """The sync pattern as seen and heard: calibrating from 3.0 s, where the
+    movie is paused, rendered to a WAV up to 8 s. A --vf filter logs each
+    frame's brightness, which gives the flashes' timestamps; the WAV ends at
+    the 8 s timestamp, which gives those of the beeps."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def render(self, *messages, opts=()):
+        """The flashes and each channel's beeps (s) with `messages` sent before calibrating."""
+        out, frames = os.path.join(self.tmp.name, "out.wav"), os.path.join(self.tmp.name, "frames.txt")
+        mpv = Mpv(self.tmp.name, "--ao=pcm", "--ao-pcm-file=" + out, "--untimed", "--pause", "--start=3",
+                  "--end=8", "--vf=lavfi=[signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=%s]" % frames,
+                  "--script-opts-append=dual_audio-auto=yes", *opts)
+        try:
+            mpv.wait_for(lambda: mpv.get("seeking") is False)
+            time.sleep(0.2)  # audio went through the filters: the delays change live, as in Live
+            for m in messages:
+                mpv.command("script-message-to", "dual_audio", *map(str, m))
+            mpv.wait_for(lambda: all(mpv.get("user-data/dual_audio")["sides"][m[1] - 1]["delay"] == m[2]
+                                     for m in messages))
+            calibrate(mpv)
+            mpv.proc.wait(timeout=60)  # unpaused: it plays to --end
+        finally:
+            mpv.close()
+        # "frame:N pts:P pts_time:T" lines, each followed by "lavfi.signalstats.YAVG=Y".
+        lines = read(frames).splitlines()
+        white = [(float(frame.split("pts_time:")[1]), float(y.split("=")[1]) > 200)
+                 for frame, y in zip(lines[::2], lines[1::2])]
+        flashes = [t for (t, w), (_, before) in zip(white, [(0, False)] + white) if w and not before]
+        n, pcm = analyze.decode(out)
+        start = 8 - len(pcm) / n / analyze.RATE
+        return flashes, [[t + start for t in ch] for ch in analyze.onsets(out)]
+
+    def assert_beeps(self, beeps, flashes, ms):
+        """Each flash's beep comes `ms` after it: those that are in the WAV."""
+        want = [t + ms / 1000 for t in flashes if 3 <= t + ms / 1000 < 8]
+        self.assertEqual(len(beeps), len(want), beeps)
+        for b, w in zip(beeps, want):
+            self.assertAlmostEqual(b, w, delta=0.002)
+
+    def test_flash_and_beep_together(self):
+        flashes, beeps = self.render()
+        self.assertEqual(flashes[:5], [3, 4, 5, 6, 7])  # once a second from where the movie was
+        for channel in beeps:
+            self.assert_beeps(channel, flashes, 0)
+
+    def test_each_side_its_delay(self):
+        # As during the movie: later, or (negative) earlier than the flash,
+        # from the first beep on.
+        for delays in ((0, 150), (-200, 0)):
+            flashes, beeps = self.render(*(("set-delay", i + 1, d) for i, d in enumerate(delays)))
+            for channel, ms in zip(beeps, delays):
+                self.assert_beeps(channel, flashes, ms)
+
+    def test_pairs(self):
+        # Both channels of a pair; the earlier pair is late too.
+        flashes, beeps = self.render(("set-delay", 1, 50), ("set-delay", 2, 150),
+                                     opts=("--script-opts-append=dual_audio-mode=pairs", "--audio-channels=quad"))
+        self.assertEqual(len(beeps), 4)
+        for channel, ms in zip(beeps, (50, 50, 150, 150)):
+            self.assert_beeps(channel, flashes, ms)
+
+
+class Calibration(Playing):
+    """Calibrating while the movie is paused at 3.0 s with subtitles, then
+    Done. The playlist holds the sample twice."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        subs = os.path.join(self.tmp.name, "subs.srt")
+        srt(subs, "Line")
+        self.start(TONES, "--sub-file=" + subs)
+
+    def start(self, movie, *opts):
+        self.mpv = Mpv(self.tmp.name, "--start=3", "--pause", "--script-opts-append=dual_audio-auto=yes",
+                       *opts, movie, src=movie)
+        self.expect((1, 2))
+
+    def tearDown(self):
+        self.mpv.close()
+        self.tmp.cleanup()
+
+    def props(self, *names):
+        return [self.mpv.get(n) for n in names]
+
+    def test_done_puts_the_movie_back(self):
+        graph = self.mpv.get("lavfi-complex")
+        self.mpv.wait_for(lambda: self.mpv.get("sub-text") == "Line 3")
+        calibrate(self.mpv)
+        self.assertIn("aevalsrc", self.mpv.get("lavfi-complex"))  # the pattern, not the tracks
+        self.assertEqual(self.props("pause", "vid", "aid", "sub-visibility", "secondary-sub-visibility"),
+                         [False, False, False, False, False])
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") > 3.5)
+        self.message("set-delay", 2, 120)  # live, as during the movie
+        self.wait_sides([(0, 0), (0, 120)])
+        self.assertIn("aevalsrc", self.mpv.get("lavfi-complex"))
+        calibrate(self.mpv, False)
+        self.expect((1, 2))  # at 3.0 s
+        self.assertEqual(self.mpv.get("lavfi-complex"), graph)
+        self.assertEqual(self.props("pause", "vid", "sub-visibility", "secondary-sub-visibility"),
+                         [True, 1, True, True])
+        self.mpv.wait_for(lambda: self.mpv.get("sub-text") == "Line 3")
+        self.af_has("delays=0|120")
+        with open(os.path.join(self.tmp.name, "devices.json")) as f:  # remembered for the headphones
+            self.assertEqual(json.load(f), {"system output (right ear)": {"gain": 0, "delay": 120}})
+
+    def test_while_playing(self):
+        # Done goes on playing, from where calibrating started.
+        self.mpv.command("set_property", "pause", False)
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") > 3.3)
+        calibrate(self.mpv)
+        pos = self.mpv.get("time-pos")
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") > pos + 1)
+        calibrate(self.mpv, False)
+        self.mpv.wait_for(lambda: abs((self.mpv.get("time-pos") or 0) - pos) < 0.3)
+        self.assertFalse(self.mpv.get("pause"))
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") > pos + 1)
+        self.assertLess(abs(self.mpv.get("avsync")), 0.1)
+
+    def test_picture_size(self):
+        # The pattern has the movie's size, so the window keeps its own.
+        small = os.path.join(self.tmp.name, "small.mkv")
+        subprocess.run(["ffmpeg", "-v", "error", "-i", TONES, "-map", "0", "-vf", "scale=320:180", "-c:v", "libx264",
+                        "-preset", "ultrafast", "-c:a", "copy", small], check=True)
+        self.mpv.close()
+        self.start(small)
+        calibrate(self.mpv)
+        self.mpv.wait_for(lambda: "aevalsrc" in self.mpv.get("lavfi-complex"))
+        self.mpv.wait_for(lambda: self.props("video-params/w", "video-params/h") == [320, 180])
+
+    def test_seeking(self):
+        # The pattern starts again where a seek lands, rather than being
+        # generated (and dropped) all the way there; Done still returns to
+        # where calibrating started.
+        calibrate(self.mpv)
+        self.mpv.command("seek", 10, "absolute")
+        self.mpv.wait_for(lambda: "asetpts=PTS+10/TB[ao]" in self.mpv.get("lavfi-complex"))
+        self.mpv.wait_for(lambda: 10 <= (self.mpv.get("time-pos") or 0) < 11)
+        calibrate(self.mpv, False)
+        self.expect((1, 2))
+
+    def test_track_change_ends_it(self):
+        # A new graph ends calibrating: the movie comes back as it was.
+        calibrate(self.mpv)
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") > 3.5)
+        self.press("}", (1, 3))
+        self.assertFalse(self.state()["calibrating"])
+        self.assertEqual(self.props("pause", "vid", "sub-visibility"), [True, 1, True])
+
+    def test_next_file_ends_it(self):
+        calibrate(self.mpv)
+        self.mpv.command("playlist-next")
+        self.mpv.wait_for(lambda: self.mpv.get("playlist-pos") == 1)
+        self.expect((1, 2))
+        self.assertFalse(self.state()["calibrating"])
+        self.assertEqual(self.props("pause", "vid", "sub-visibility"), [True, 1, True])
+
+
 class Devices(unittest.TestCase):
     """dualplay -2's headphones: a pair moving to others (as the bubbaTV menu
     asks) and dropping out mid-movie (as the menu reports). A fake helper
@@ -826,6 +995,16 @@ class Devices(unittest.TestCase):
         self.wait_lost([False, False])
         self.assertTrue(self.mpv.get("pause"))  # resuming is up to the people watching
 
+    def test_dropout_while_calibrating(self):
+        # Done puts back the pause state from before, but headphones that
+        # dropped out meanwhile keep the movie paused.
+        self.mpv.command("set_property", "pause", False)
+        calibrate(self.mpv)
+        self.message("outputs", "Nikita’s AirPods", "MacBook Pro Speakers")
+        self.mpv.wait_for(lambda: self.mpv.get("pause"))
+        calibrate(self.mpv, False)
+        self.assertTrue(self.mpv.get("pause"))
+
 
 class Subs(unittest.TestCase):
     """Subtitles keep coming after the audio graph is rebuilt. The cache is kept
@@ -858,6 +1037,11 @@ class Subs(unittest.TestCase):
 
     def test_toggle_off(self):
         self.mpv.command("keypress", "a")
+        self.assert_subs_keep_coming()
+
+    def test_calibrate(self):
+        calibrate(self.mpv)
+        calibrate(self.mpv, False)
         self.assert_subs_keep_coming()
 
 
@@ -970,6 +1154,18 @@ class FollowSubs(Playing):
         self.press("a", (1, 2))
         self.shows("Eng", "Rus")
 
+    def test_calibrate(self):
+        # Hidden while the pattern plays; hiding them is no pick of one's own.
+        self.start(FOLLOW)
+        self.shows("Eng", "Rus")
+        calibrate(self.mpv)
+        self.assertEqual([self.mpv.get("sub-visibility"), self.mpv.get("secondary-sub-visibility")], [False, False])
+        calibrate(self.mpv, False)
+        self.expect((1, 2))
+        self.shows("Eng", "Rus")
+        self.assertEqual([self.mpv.get("sub-visibility"), self.mpv.get("secondary-sub-visibility")], [True, True])
+        self.assertTrue(self.state()["follow_subs"])
+
     def test_keep_coming_after_graph_change(self):
         # A swap rebuilds the graph: both subtitles must be selected anew
         # (see Subs). A loudness change before it is live and leaves them be.
@@ -1068,6 +1264,15 @@ class Menu(unittest.TestCase):
                        "  [x] [1] English 440Hz (eng)\n  [2] Russian 1000Hz 5.1 (rus)\n"
                        "  [3] German 2500Hz (ger)\nLoudness -6 dB\nDelay 0 ms")
         self.assertIn("Loudness 0 dB\nDelay +120 ms", self.menu())
+
+    def test_calibrate_item(self):
+        self.mpv.command("keypress", "a")
+        self.wait_menu("---\nCalibrate delay…\nSwap pairs")
+        calibrate(self.mpv)
+        self.wait_menu("---\nDone calibrating\nSwap pairs")
+        self.assertIn("Pair 2\nDevice: Friend, Pro (disabled)\nAudio track:", self.menu())  # still set per pair
+        calibrate(self.mpv, False)
+        self.wait_menu("---\nCalibrate delay…\nSwap pairs")
 
     def test_follow_subs_item(self):
         self.mpv.command("keypress", "a")

@@ -140,6 +140,11 @@ Thread {
     }
     wait("right loudness +") { sides().last?["gain"] as? Double == 1 }
     check("live: the graph stays", graph() == before)
+    ui { click(menu(), "Calibrate delay…") }
+    wait("the sync pattern plays") { graph().hasPrefix("color=") }
+    wait("menu offers Done") { ui { menu().item(withTitle: "Done calibrating") != nil } }
+    ui { click(menu(), "Done calibrating") }
+    wait("the movie is back") { graph() == before }
     ui { click(menu(), "Subtitles follow ears") }
     wait("subtitles follow the ears") {
         get("user-data/dual_audio").contains("\"follow_subs\":true")
