@@ -23,6 +23,7 @@ SCRIPT = os.path.join(ROOT, "scripts", "dual_audio.lua")
 MENU = os.path.join(ROOT, "tools", "bubbatv-menu.swift")
 DUALPLAY = os.path.join(ROOT, "dualplay")
 TONES = os.path.join(ROOT, "samples", "tones.mkv")  # 1=eng 440Hz, 2=rus 1000Hz 5.1, 3=ger 2500Hz
+SYNC = os.path.join(ROOT, "samples", "sync.mkv")    # both tracks beep for 0.1 s once a second
 BASE = ["mpv", "--no-config", "--script=" + SCRIPT, "--vo=null", "--really-quiet"]
 
 
@@ -72,12 +73,12 @@ def devices_file(tmpdir):
 class Render(unittest.TestCase):
     """Render 3s of playback to a WAV and inspect the channels."""
 
-    def render(self, *opts, src=TONES):
+    def render(self, *opts, src=TONES, video=False, analyse=analyze.tones):
         out = os.path.join(self.tmp.name, "out.wav")
-        subprocess.run(BASE + ["--no-video", "--ao=pcm", "--ao-pcm-file=" + out,
+        subprocess.run(BASE + ([] if video else ["--no-video"]) + ["--ao=pcm", "--ao-pcm-file=" + out,
                                "--untimed", "--end=3", *opts, devices_file(self.tmp.name), src],
                        check=True, timeout=60)
-        return analyze.tones(out)
+        return analyse(out)
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -156,6 +157,31 @@ class Render(unittest.TestCase):
                         "-c", "copy", dub], check=True)
         self.assertEqual(self.render("--script-opts=dual_audio-auto=yes,dual_audio-right_lang=ger",
                                      "--audio-file=" + dub, src=video), [440, 2500])
+
+    def save(self, settings):
+        with open(os.path.join(self.tmp.name, "devices.json"), "w") as f:
+            json.dump(settings, f)
+
+    def test_saved_delays_move_each_ear(self):
+        # Delays saved per ear come back at launch and move that ear against
+        # the picture: the first beep after 0.5 s (with the flash) comes
+        # that much later or, negative, earlier. Both ways round, as the
+        # graph orders its inputs by delay.
+        def beeps():
+            return self.render("--script-opts=dual_audio-auto=yes", "--start=0.5", src=SYNC,
+                               video=True, analyse=analyze.onsets)
+        plain = beeps()
+        for delays in ((-200, 0), (100, -300)):
+            self.save({"system output (left ear)": {"gain": 0, "delay": delays[0]},
+                       "system output (right ear)": {"gain": 0, "delay": delays[1]}})
+            moved = [round(t - p, 3) for t, p in zip(beeps(), plain)]
+            self.assertEqual(moved, [d / 1000 for d in delays])
+
+    def test_pairs_keep_their_channels_when_held_back(self):
+        # A delayed first pair goes into the join second, and still to 1-2.
+        self.save({"system output (pair 1)": {"gain": 0, "delay": 100}})
+        self.assertEqual(self.render("--script-opts=dual_audio-auto=yes,dual_audio-mode=pairs",
+                                     "--audio-channels=quad"), [440, 440, 1000, 1000])
 
 
 class Mpv:
@@ -354,18 +380,42 @@ class Keys(Playing):
                          [(3, 0, 0), (1, -6, 150)])
         self.assertEqual([s["name"] for s in sides], ["Left ear", "Right ear"])
 
-    def test_negative_delay_moves_audio_delay(self):
+    def test_negative_delay_leaves_audio_delay(self):
         # The graph can only hold a side back: the other side is delayed
-        # instead, and mpv's own audio-delay (the user's 0.1 s here) moves
-        # everything earlier - and comes back when dual audio goes off.
+        # instead, and asetpts moves the output earlier. mpv's own
+        # audio-delay (the user's 0.1 s here) is left alone.
         self.mpv.command("set_property", "audio-delay", 0.1)
         self.press("a", (1, 2))
         self.message("set-delay", 1, -200)
-        self.mpv.wait_for(lambda: "adelay=200:all=1,volume=0dB[r]" in self.mpv.get("lavfi-complex"))
+        self.graph_has("adelay=200:all=1,volume=0dB[r]", "asetpts=PTS-0.2/TB[ao]")
         self.assertNotIn("adelay", self.mpv.get("lavfi-complex").split("[l]")[0])
-        self.assertAlmostEqual(self.mpv.get("audio-delay"), -0.1)
+        self.assertAlmostEqual(self.mpv.get("audio-delay"), 0.1)
         self.expect((1, 2))
         self.press("a", None)
+        self.assertAlmostEqual(self.mpv.get("audio-delay"), 0.1)
+
+    def test_watch_later_keeps_own_audio_delay(self):
+        # mpv writes the watch-later file inside the quit command, from the
+        # properties as they are right then. A negative delay must not be in
+        # audio-delay by then, or the next start is off by it.
+        later = os.path.join(self.tmp.name, "later")
+        self.restart("--watch-later-dir=" + later)
+        self.mpv.command("set_property", "audio-delay", 0.1)
+        self.press("a", (1, 2))
+        self.message("set-delay", 1, -200)
+        self.graph_has("asetpts=PTS-0.2/TB")
+        self.mpv.command("keypress", "Q")  # quit-watch-later
+        self.mpv.proc.wait(timeout=10)
+        confs = []
+        for name in os.listdir(later):  # the file's, and redirects for its parent dirs
+            with open(os.path.join(later, name)) as f:
+                confs.append(f.read())
+        [conf] = [c for c in confs if "start=" in c]
+        self.assertIn("audio-delay=0.100000\n", conf)
+        self.restart("--watch-later-dir=" + later)
+        self.assertAlmostEqual(self.mpv.get("audio-delay"), 0.1)
+        self.press("a", (1, 2))
+        self.graph_has("adelay=200:all=1,volume=0dB[r]", "asetpts=PTS-0.2/TB")
         self.assertAlmostEqual(self.mpv.get("audio-delay"), 0.1)
 
     def test_settings_remembered(self):
@@ -396,14 +446,14 @@ class Keys(Playing):
         self.press("a", (1, 2))
         self.message("set-gain", 1, -4)
         self.message("set-delay", 2, -150)
-        self.graph_has("adelay=150:all=1,volume=-4dB[l]", "volume=0dB[r]")
+        self.graph_has("adelay=150:all=1,volume=-4dB[l]", "volume=0dB[r]", "asetpts=PTS-0.15/TB")
         self.press("y", (2, 1))
         self.graph_has("adelay=150:all=1,volume=-4dB[l]", "volume=0dB[r]")
         self.assertEqual(self.saved(), {"Nikita’s AirPods": {"gain": -4, "delay": 0},
                                         "Friend, Pro": {"gain": 0, "delay": -150}})
         self.restart(pairs, "--script-opts-append=dual_audio-pair_names=Friend, Pro|Nikita’s AirPods")
         self.press("a", (1, 2))
-        self.graph_has("volume=0dB[l]", "adelay=150:all=1,volume=-4dB[r]")
+        self.graph_has("volume=0dB[l]", "adelay=150:all=1,volume=-4dB[r]", "asetpts=PTS-0.15/TB")
         self.assertEqual([(s["device"], s["gain"], s["delay"]) for s in self.state()["sides"]],
                          [("Friend, Pro", 0, -150), ("Nikita’s AirPods", -4, 0)])
 
@@ -439,6 +489,8 @@ class Keys(Playing):
 
     def test_av_sync_while_playing(self):
         self.press("a", (1, 2))
+        self.message("set-delay", 2, -200)  # the left ear held back, the output moved earlier
+        self.graph_has("[r][l]join", "asetpts")
         self.mpv.command("set_property", "pause", False)
         time.sleep(3)
         self.assertLess(abs(self.mpv.get("avsync")), 0.1)

@@ -66,7 +66,6 @@ local enabled = opts.auto
 local left, right       -- track ids for the current file (may be the same)
 local gain = { 0, 0 }   -- dB per side: left ear / first pair, then the other
 local delay = { 0, 0 }  -- ms per side; negative plays that side earlier
-local delay_shift = 0   -- s added to audio-delay for negative delays (see apply)
 local ours = false      -- lavfi-complex currently holds our graph
 -- Languages to look for in the next file; follows manual track changes so a
 -- playlist of episodes keeps the same assignment.
@@ -151,9 +150,12 @@ local function remember(tracks)
     pref.same = left == right
 end
 
--- The graph can only hold a side back, so negative delays shift both sides
--- later by the most negative one, and mpv's audio-delay takes it back.
-local function base_delay() return math.min(0, delay[1], delay[2]) end
+-- adelay only holds a side back, so it holds back the later side by the
+-- difference, and asetpts moves the whole output by the earlier side's
+-- delay, either way. Not mpv's audio-delay: mpv writes that into
+-- watch-later files (inside the quit command, with no event before it),
+-- and the next start would be off by the shift.
+local function base_delay() return math.min(delay[1], delay[2]) end
 
 local function input(src, side, pad)
     local d = delay[side] - base_delay()
@@ -168,10 +170,17 @@ local function graph()
     -- A track feeds only one filter, so split it when both sides play it.
     if left == right then split, l, r = l .. "asplit=2[sl][sr];", "[sl]", "[sr]" end
     local g = split .. input(l, 1, "l") .. input(r, 2, "r")
+    -- join takes its timestamps from its first input, and adelay's leading
+    -- silence has none: mpv would then misplace both sides against the
+    -- picture. So the side held back goes in second.
+    local ins, a, b = "[l][r]", 0, 1  -- join inputs; which one is l, which r
+    if delay[1] > delay[2] then ins, a, b = "[r][l]", 1, 0 end
+    local out = base_delay() ~= 0 and string.format(",asetpts=PTS%+g/TB", base_delay() / 1000) or ""
     if pairs_mode then
-        return g .. "[l][r]join=inputs=2:channel_layout=quad:map=0.0-FL|0.1-FR|1.0-BL|1.1-BR[ao]"
+        return g .. string.format("%sjoin=inputs=2:channel_layout=quad:map=%d.0-FL|%d.1-FR|%d.0-BL|%d.1-BR%s[ao]",
+            ins, a, a, b, b, out)
     end
-    return g .. "[l][r]join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR[ao]"
+    return g .. string.format("%sjoin=inputs=2:channel_layout=stereo:map=%d.0-FL|%d.0-FR%s[ao]", ins, a, b, out)
 end
 
 local function label(tracks, id)
@@ -335,12 +344,6 @@ local function apply(live)
     local pos = live and mp.get_property_number("time-pos")
     mp.set_property("lavfi-complex", want and graph() or "")
     ours = want
-    local shift = want and base_delay() / 1000 or 0
-    if shift ~= delay_shift then
-        mp.set_property_number("audio-delay",
-            mp.get_property_number("audio-delay", 0) + shift - delay_shift)
-        delay_shift = shift
-    end
     -- Back to normal playback: keep the left-ear / first-pair language.
     if not want and left then mp.set_property_number("aid", left) end
     update_subs(live)

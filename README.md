@@ -209,6 +209,8 @@ devices_file=~~/dual_audio-devices.json
 
 - **Separate dub file:** `./dualplay -r rus movie.mkv --audio-file=movie.rus.mka`
 - **Series:** in a playlist, the next episode keeps the languages you chose.
+- **Quit and resume** (`Shift+Q`) saves your own audio delay (`Ctrl+-` / `Ctrl++`)
+  as mpv does; the pairs' delays come back from their headphones.
 - **With one shared pair, each ear gets a mono downmix** of its track. For 5.1 tracks the centre
   channel (dialogue) keeps its full level, so a stereo and a 5.1 track sound
   about equally loud. If one is quieter, use `h` / `k`.
@@ -227,9 +229,13 @@ graph. The plugin builds this graph:
 ```
 
 With `-2` each track stays stereo and the join gives four channels
-(FL FR BL BR). A pair's loudness is its `volume`, its delay an `adelay` in
-front of it (a negative delay delays the other pair and moves mpv's
-audio-delay earlier). When both sides play one track, `asplit` feeds it to both. `tools/audio-pairs.swift` combines the two headphone outputs
+(FL FR BL BR). A pair's loudness is its `volume`. For the delays an `adelay`
+holds the later pair back by the difference, and `asetpts` after the join
+moves both by the earlier pair's delay (earlier, for a negative one). That
+leaves mpv's own audio delay alone, which mpv saves for the next start on
+`Shift+Q`. The held-back pair goes into the join second: `join` takes its
+timestamps from its first input, and `adelay`'s leading silence has none.
+When both sides play one track, `asplit` feeds it to both. `tools/audio-pairs.swift` combines the two headphone outputs
 into one CoreAudio *aggregate device*: channels 1–2 go to the first pair, 3–4
 to the second. The second pair follows the first one's clock (drift
 correction). The device exists only while `dualplay` runs.
@@ -262,8 +268,8 @@ python3 tests/test_dual_audio.py
 Generates `samples/` (via `tools/make-samples.sh`): `tones.mkv` has a
 distinct sine tone per track, and the tests play it through mpv and check which
 tone lands in which channel, including key presses sent over mpv's IPC socket,
-and which subtitle lines show for which pair. Remembered settings go to temp
-dirs.
+and which subtitle lines show for which pair; `sync.mkv` shows when each ear's
+beeps arrive. Remembered settings and watch-later files go to temp dirs.
 With `swiftc` they also build the bubbaTV menu, load it into mpv and click
 through it (`tests/menu_clicks/`). They build bubbaTV.app too and check the
 command its `--dry-run` prints.
