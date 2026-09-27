@@ -8,7 +8,8 @@ Watch a movie with a friend in two languages at once, on one Mac:
 It's a plugin for [mpv](https://mpv.io) (`scripts/dual_audio.lua`) plus a
 small launcher (`dualplay`), with a **bubbaTV** menu in mpv's menu bar for
 each pair's headphones, track, loudness and delay, and subtitles in both
-languages. The **bubbaTV** app starts a movie without the terminal.
+languages. Loudness and delay are remembered per headphones. The **bubbaTV**
+app starts a movie without the terminal.
 
 ## Quick start
 
@@ -71,6 +72,8 @@ outputs, or name them with `-p` (`./dualplay -L` lists the outputs), e.g.
 **Other headphones mid-movie:** each pair's **Device** in the bubbaTV menu
 lists the connected outputs; pick one and that pair plays there (pick the
 other pair's and the two swap). Switching takes a few seconds of silence.
+The headphones bring their own loudness and delay
+([remembered](#remembered-per-headphones)).
 
 **Headphones that drop out** (flat battery, out of range) pause the movie,
 and the screen says which pair it was. Reconnect them (Control Center →
@@ -83,6 +86,8 @@ and the bubbaTV menu sets each pair's loudness on its own.
 If speech lags the picture, `Ctrl+-` plays the audio 100 ms earlier (`Ctrl++` later);
 if only one pair lags (Bluetooth headphones differ), give that pair a negative delay
 in the bubbaTV menu. `samples/sync.mkv` flashes and beeps once a second to check this.
+Both are remembered for those headphones, so you set them once
+([below](#remembered-per-headphones)).
 
 ## The bubbaTV menu
 
@@ -131,6 +136,32 @@ file name.
 - The top line is plain text (mpv drops its styling), and picture subtitles
   (PGS, VobSub) can't move up there, so as a second line they overlap the first.
 
+## Remembered per headphones
+
+A pair's loudness and delay — from the menu, `h` / `k` or a script message —
+are saved for its headphones as soon as they change, and come back whenever
+those headphones play again: the next file, the next launch, and after `y`,
+with the pairs picked the other way round (`-p B -p A`) or when a pair moves
+to other headphones in the menu's **Device**. They stay with the headphones,
+not with the track or language. Pairs are told apart by name, so if both are
+called just "AirPods", rename one in its Bluetooth settings.
+
+With one shared pair, each ear keeps its own. The script can't see which
+device the Mac's sound output is (mpv only calls it "auto"), so the ears are
+saved as the left and right ear of "system output": whichever headphones the
+Mac plays to. With `--audio-device=…` that device's ears get their own.
+
+They are kept in `~/.config/mpv/dual_audio-devices.json`, one entry each:
+
+```json
+{"Nikita’s AirPods Pro": {"gain": -4, "delay": 0}, "Friend’s Beats": {"gain": 0, "delay": -120},
+ "system output (left ear)": {"gain": -2, "delay": 0}}
+```
+
+Setting both back to 0 forgets a pair. `devices_file` in the options below
+moves the file, or turns this off (`devices_file=`); with `mpv --no-config`
+they last only until mpv quits.
+
 ## Keys
 
 | Key | Action |
@@ -173,12 +204,16 @@ right_lang=rus,ru
 balance_step=2
 # subtitles in both pairs' languages
 follow_subs=yes
+# where each headphones' loudness and delay are remembered (~~ = mpv's config dir)
+devices_file=~~/dual_audio-devices.json
 ```
 
 ## Good to know
 
 - **Separate dub file:** `./dualplay -r rus movie.mkv --audio-file=movie.rus.mka`
 - **Series:** in a playlist, the next episode keeps the languages you chose.
+- **Quit and resume** (`Shift+Q`) saves your own audio delay (`Ctrl+-` / `Ctrl++`)
+  as mpv does; the pairs' delays come back from their headphones.
 - **With one shared pair, each ear gets a mono downmix** of its track. For 5.1 tracks the centre
   channel (dialogue) keeps its full level, so a stereo and a 5.1 track sound
   about equally loud. If one is quieter, use `h` / `k`.
@@ -197,9 +232,13 @@ graph. The plugin builds this graph:
 ```
 
 With `-2` each track stays stereo and the join gives four channels
-(FL FR BL BR). A pair's loudness is its `volume`, its delay an `adelay` in
-front of it (a negative delay delays the other pair and moves mpv's
-audio-delay earlier). When both sides play one track, `asplit` feeds it to both. `tools/audio-pairs.swift` combines the two headphone outputs
+(FL FR BL BR). A pair's loudness is its `volume`. For the delays an `adelay`
+holds the later pair back by the difference, and `asetpts` after the join
+moves both by the earlier pair's delay (earlier, for a negative one). That
+leaves mpv's own audio delay alone, which mpv saves for the next start on
+`Shift+Q`. The held-back pair goes into the join second: `join` takes its
+timestamps from its first input, and `adelay`'s leading silence has none.
+When both sides play one track, `asplit` feeds it to both. `tools/audio-pairs.swift` combines the two headphone outputs
 into one CoreAudio *aggregate device*: channels 1–2 go to the first pair, 3–4
 to the second. The second pair follows the first one's clock (drift
 correction). The device exists only while `dualplay` runs.
@@ -232,7 +271,8 @@ python3 tests/test_dual_audio.py
 Generates `samples/` (via `tools/make-samples.sh`): `tones.mkv` has a
 distinct sine tone per track, and the tests play it through mpv and check which
 tone lands in which channel, including key presses sent over mpv's IPC socket,
-and which subtitle lines show for which pair.
+and which subtitle lines show for which pair; `sync.mkv` shows when each ear's
+beeps arrive. Remembered settings and watch-later files go to temp dirs.
 With `swiftc` they also build the bubbaTV menu, load it into mpv and click
 through it (`tests/menu_clicks/`). They build bubbaTV.app too and check the
 command its `--dry-run` prints.

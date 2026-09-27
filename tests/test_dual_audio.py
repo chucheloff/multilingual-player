@@ -23,6 +23,7 @@ SCRIPT = os.path.join(ROOT, "scripts", "dual_audio.lua")
 MENU = os.path.join(ROOT, "tools", "bubbatv-menu.swift")
 DUALPLAY = os.path.join(ROOT, "dualplay")
 TONES = os.path.join(ROOT, "samples", "tones.mkv")  # 1=eng 440Hz, 2=rus 1000Hz 5.1, 3=ger 2500Hz
+SYNC = os.path.join(ROOT, "samples", "sync.mkv")    # both tracks beep for 0.1 s once a second
 BASE = ["mpv", "--no-config", "--script=" + SCRIPT, "--vo=null", "--really-quiet"]
 
 
@@ -63,14 +64,21 @@ def ao_inits(log):
     return read(log).count("] AO: [")
 
 
+def devices_file(tmpdir):
+    """Keeps the remembered loudness and delay in the test's temp dir. Goes
+    after the other script options: a plain --script-opts replaces them all."""
+    return "--script-opts-append=dual_audio-devices_file=" + os.path.join(tmpdir, "devices.json")
+
+
 class Render(unittest.TestCase):
     """Render 3s of playback to a WAV and inspect the channels."""
 
-    def render(self, *opts, src=TONES):
+    def render(self, *opts, src=TONES, video=False, analyse=analyze.tones):
         out = os.path.join(self.tmp.name, "out.wav")
-        subprocess.run(BASE + ["--no-video", "--ao=pcm", "--ao-pcm-file=" + out,
-                               "--untimed", "--end=3", *opts, src], check=True, timeout=60)
-        return analyze.tones(out)
+        subprocess.run(BASE + ([] if video else ["--no-video"]) + ["--ao=pcm", "--ao-pcm-file=" + out,
+                               "--untimed", "--end=3", *opts, devices_file(self.tmp.name), src],
+                       check=True, timeout=60)
+        return analyse(out)
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -131,7 +139,8 @@ class Render(unittest.TestCase):
                          "--msg-level=all=no,dual_audio=info",
                          "--script-opts-append=dual_audio-auto=yes",
                          "--script-opts-append=dual_audio-mode=pairs",
-                         "--script-opts-append=dual_audio-pair_names=Nikita’s AirPods|Friend, Pro", TONES],
+                         "--script-opts-append=dual_audio-pair_names=Nikita’s AirPods|Friend, Pro",
+                         devices_file(self.tmp.name), TONES],
             capture_output=True, text=True, check=True, timeout=60)
         log = out.stdout + out.stderr
         self.assertIn("Nikita’s AirPods: [1] English 440Hz (eng)", log)
@@ -149,17 +158,45 @@ class Render(unittest.TestCase):
         self.assertEqual(self.render("--script-opts=dual_audio-auto=yes,dual_audio-right_lang=ger",
                                      "--audio-file=" + dub, src=video), [440, 2500])
 
+    def save(self, settings):
+        with open(os.path.join(self.tmp.name, "devices.json"), "w") as f:
+            json.dump(settings, f)
+
+    def test_saved_delays_move_each_ear(self):
+        # Delays saved per ear come back at launch and move that ear against
+        # the picture: the first beep after 0.5 s (with the flash) comes
+        # that much later or, negative, earlier. Both ways round, as the
+        # graph orders its inputs by delay.
+        def beeps():
+            return self.render("--script-opts=dual_audio-auto=yes", "--start=0.5", src=SYNC,
+                               video=True, analyse=analyze.onsets)
+        plain = beeps()
+        for delays in ((-200, 0), (100, -300)):
+            self.save({"system output (left ear)": {"gain": 0, "delay": delays[0]},
+                       "system output (right ear)": {"gain": 0, "delay": delays[1]}})
+            moved = [round(t - p, 3) for t, p in zip(beeps(), plain)]
+            self.assertEqual(moved, [d / 1000 for d in delays])
+
+    def test_pairs_keep_their_channels_when_held_back(self):
+        # A delayed first pair goes into the join second, and still to 1-2.
+        self.save({"system output (pair 1)": {"gain": 0, "delay": 100}})
+        self.assertEqual(self.render("--script-opts=dual_audio-auto=yes,dual_audio-mode=pairs",
+                                     "--audio-channels=quad"), [440, 440, 1000, 1000])
+
 
 class Mpv:
     """A real-time mpv instance driven over its JSON IPC socket. `cmd` can put
-    dualplay in front of it (with the file in `cmd` and src=None)."""
+    dualplay in front of it (with the file in `cmd` and src=None). The
+    remembered device settings go to devices.json in `store` (default: tmpdir;
+    False: wherever the plugin puts them by default)."""
 
-    def __init__(self, tmpdir, *opts, src=TONES, cmd=BASE, env=None):
+    def __init__(self, tmpdir, *opts, src=TONES, cmd=BASE, env=None, store=None):
         self.path = os.path.join(tmpdir, "mpv.sock")
         if os.path.exists(self.path):  # left by an mpv before
             os.unlink(self.path)
+        own = [] if store is False else [devices_file(store or tmpdir)]
         self.proc = subprocess.Popen(cmd + ["--ao=null", "--input-ipc-server=" + self.path,
-                                            *opts, *([src] if src else [])],
+                                            *opts, *own, *([src] if src else [])],
                                      env=env, stdout=subprocess.DEVNULL)
         deadline = time.time() + 10
         while not os.path.exists(self.path):
@@ -249,6 +286,9 @@ class Playing(unittest.TestCase):
     def state(self):
         return self.mpv.get("user-data/dual_audio")
 
+    def graph_has(self, *parts):
+        self.mpv.wait_for(lambda: all(p in self.mpv.get("lavfi-complex") for p in parts))
+
 
 class Keys(Playing):
     """Key bindings while playing. Paused at 3.0s so any position jump shows up.
@@ -262,6 +302,20 @@ class Keys(Playing):
     def tearDown(self):
         self.mpv.close()
         self.tmp.cleanup()
+
+    def restart(self, *opts):
+        """Quit mpv and start it again as setUp does - a fresh socket, the same
+        remembered device settings."""
+        self.mpv.close()
+        self.runs = getattr(self, "runs", 0) + 1
+        run = os.path.join(self.tmp.name, "run%d" % self.runs)
+        os.mkdir(run)
+        self.mpv = Mpv(run, "--start=3", "--pause", *opts, TONES, store=self.tmp.name)
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") is not None)
+
+    def saved(self):
+        with open(os.path.join(self.tmp.name, "devices.json")) as f:
+            return json.load(f)
 
     def test_toggle_cycle_swap(self):
         self.press("a", (1, 2))     # on: current track left, next right
@@ -326,22 +380,117 @@ class Keys(Playing):
                          [(3, 0, 0), (1, -6, 150)])
         self.assertEqual([s["name"] for s in sides], ["Left ear", "Right ear"])
 
-    def test_negative_delay_moves_audio_delay(self):
+    def test_negative_delay_leaves_audio_delay(self):
         # The graph can only hold a side back: the other side is delayed
-        # instead, and mpv's own audio-delay (the user's 0.1 s here) moves
-        # everything earlier - and comes back when dual audio goes off.
+        # instead, and asetpts moves the output earlier. mpv's own
+        # audio-delay (the user's 0.1 s here) is left alone.
         self.mpv.command("set_property", "audio-delay", 0.1)
         self.press("a", (1, 2))
         self.message("set-delay", 1, -200)
-        self.mpv.wait_for(lambda: "adelay=200:all=1,volume=0dB[r]" in self.mpv.get("lavfi-complex"))
+        self.graph_has("adelay=200:all=1,volume=0dB[r]", "asetpts=PTS-0.2/TB[ao]")
         self.assertNotIn("adelay", self.mpv.get("lavfi-complex").split("[l]")[0])
-        self.assertAlmostEqual(self.mpv.get("audio-delay"), -0.1)
+        self.assertAlmostEqual(self.mpv.get("audio-delay"), 0.1)
         self.expect((1, 2))
         self.press("a", None)
         self.assertAlmostEqual(self.mpv.get("audio-delay"), 0.1)
 
+    def test_watch_later_keeps_own_audio_delay(self):
+        # mpv writes the watch-later file inside the quit command, from the
+        # properties as they are right then. A negative delay must not be in
+        # audio-delay by then, or the next start is off by it.
+        later = os.path.join(self.tmp.name, "later")
+        self.restart("--watch-later-dir=" + later)
+        self.mpv.command("set_property", "audio-delay", 0.1)
+        self.press("a", (1, 2))
+        self.message("set-delay", 1, -200)
+        self.graph_has("asetpts=PTS-0.2/TB")
+        self.mpv.command("keypress", "Q")  # quit-watch-later
+        self.mpv.proc.wait(timeout=10)
+        confs = []
+        for name in os.listdir(later):  # the file's, and redirects for its parent dirs
+            with open(os.path.join(later, name)) as f:
+                confs.append(f.read())
+        [conf] = [c for c in confs if "start=" in c]
+        self.assertIn("audio-delay=0.100000\n", conf)
+        self.restart("--watch-later-dir=" + later)
+        self.assertAlmostEqual(self.mpv.get("audio-delay"), 0.1)
+        self.press("a", (1, 2))
+        self.graph_has("adelay=200:all=1,volume=0dB[r]", "asetpts=PTS-0.2/TB")
+        self.assertAlmostEqual(self.mpv.get("audio-delay"), 0.1)
+
+    def test_settings_remembered(self):
+        # Loudness and delay are saved as they change, and are back for the
+        # next file and the next launch. In ears mode each ear of the system
+        # output keeps its own.
+        self.press("a", (1, 2))
+        self.mpv.command("keypress", "h")  # the right ear 2 dB down
+        self.message("set-delay", 1, 120)
+        self.graph_has("adelay=120:all=1,volume=0dB[l]", "volume=-2dB[r]")
+        self.assertEqual(self.saved(), {"system output (left ear)": {"gain": 0, "delay": 120},
+                                        "system output (right ear)": {"gain": -2, "delay": 0}})
+        self.next_file()
+        self.graph_has("adelay=120:all=1,volume=0dB[l]", "volume=-2dB[r]")
+        self.restart()
+        self.press("a", (1, 2))
+        self.graph_has("adelay=120:all=1,volume=0dB[l]", "volume=-2dB[r]")
+        self.assertEqual([(s["gain"], s["delay"]) for s in self.state()["sides"]], [(0, 120), (-2, 0)])
+        self.message("set-delay", 1, 0)
+        self.message("set-gain", 2, 0)
+        self.mpv.wait_for(lambda: self.saved() == {})  # back at 0 / 0: nothing to remember
+
+    def test_settings_follow_the_headphones(self):
+        # Pairs mode keys them by device name: they stay with the pair when
+        # the tracks swap, and find it again when it comes second next time.
+        pairs = "--script-opts-append=dual_audio-mode=pairs"
+        self.restart(pairs, "--script-opts-append=dual_audio-pair_names=Nikita’s AirPods|Friend, Pro")
+        self.press("a", (1, 2))
+        self.message("set-gain", 1, -4)
+        self.message("set-delay", 2, -150)
+        self.graph_has("adelay=150:all=1,volume=-4dB[l]", "volume=0dB[r]", "asetpts=PTS-0.15/TB")
+        self.press("y", (2, 1))
+        self.graph_has("adelay=150:all=1,volume=-4dB[l]", "volume=0dB[r]")
+        self.assertEqual(self.saved(), {"Nikita’s AirPods": {"gain": -4, "delay": 0},
+                                        "Friend, Pro": {"gain": 0, "delay": -150}})
+        self.restart(pairs, "--script-opts-append=dual_audio-pair_names=Friend, Pro|Nikita’s AirPods")
+        self.press("a", (1, 2))
+        self.graph_has("volume=0dB[l]", "adelay=150:all=1,volume=-4dB[r]", "asetpts=PTS-0.15/TB")
+        self.assertEqual([(s["device"], s["gain"], s["delay"]) for s in self.state()["sides"]],
+                         [("Friend, Pro", 0, -150), ("Nikita’s AirPods", -4, 0)])
+
+    def test_ears_settings_per_output(self):
+        # Another output named in audio-device has ears of its own; going
+        # back to the system output brings its settings back.
+        self.press("a", (1, 2))
+        self.message("set-gain", 1, -6)
+        self.graph_has("volume=-6dB[l]")
+        self.mpv.command("set_property", "audio-device", "coreaudio/test-uid")
+        self.graph_has("volume=0dB[l]")
+        self.expect((1, 2))
+        self.message("set-gain", 2, -3)
+        self.graph_has("volume=-3dB[r]")
+        self.assertEqual(self.saved(), {"system output (left ear)": {"gain": -6, "delay": 0},
+                                        "coreaudio/test-uid (right ear)": {"gain": -3, "delay": 0}})
+        self.mpv.command("set_property", "audio-device", "auto")
+        self.graph_has("volume=-6dB[l]", "volume=0dB[r]")
+
+    def test_default_file_in_config_dir(self):
+        # ~~/dual_audio-devices.json: mpv's config dir, made on the first save.
+        self.mpv.close()
+        cfg = os.path.join(self.tmp.name, "cfg")
+        os.mkdir(os.path.join(self.tmp.name, "run"))  # a fresh socket path
+        self.mpv = Mpv(os.path.join(self.tmp.name, "run"), "--start=3", "--pause", TONES, store=False,
+                       cmd=["mpv", "--config-dir=" + cfg] + BASE[2:])
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") is not None)
+        self.press("a", (1, 2))
+        self.message("set-gain", 2, -6)
+        self.graph_has("volume=-6dB[r]")
+        with open(os.path.join(cfg, "dual_audio-devices.json")) as f:
+            self.assertEqual(json.load(f), {"system output (right ear)": {"gain": -6, "delay": 0}})
+
     def test_av_sync_while_playing(self):
         self.press("a", (1, 2))
+        self.message("set-delay", 2, -200)  # the left ear held back, the output moved earlier
+        self.graph_has("[r][l]join", "asetpts")
         self.mpv.command("set_property", "pause", False)
         time.sleep(3)
         self.assertLess(abs(self.mpv.get("avsync")), 0.1)
@@ -380,6 +529,9 @@ class Devices(unittest.TestCase):
     def wait_logged(self, text):
         self.mpv.wait_for(lambda: text in read(self.log))
 
+    def graph_has(self, *parts):
+        self.mpv.wait_for(lambda: all(p in self.mpv.get("lavfi-complex") for p in parts))
+
     def wait_lost(self, lost):
         self.mpv.wait_for(lambda: [s.get("lost", False) for s in self.sides()] == lost)
 
@@ -410,6 +562,26 @@ class Devices(unittest.TestCase):
         self.wait_logged('could not switch the headphones | "Broken" matches 0 outputs')
         self.assertEqual(self.devices(), ["Nikita’s AirPods", "Friend, Pro"])
         self.assertEqual(ao_inits(self.log), 1)
+
+    def test_settings_follow_a_move(self):
+        # Loudness and delay stay with the headphones: after a swap they are
+        # on the other pair, and headphones new to a pair bring their own.
+        self.message("set-gain", 2, -6)
+        self.graph_has("volume=0dB[l]", "volume=-6dB[r]")
+        self.message("set-device", 1, "Friend, Pro")
+        self.mpv.wait_for(lambda: self.devices() == ["Friend, Pro", "Nikita’s AirPods"])
+        self.graph_has("volume=-6dB[l]", "volume=0dB[r]")
+        self.assertEqual([s["gain"] for s in self.sides()], [-6, 0])
+        self.message("set-delay", 2, 120)  # Nikita's
+        self.graph_has("adelay=120:all=1,volume=0dB[r]")
+        self.message("set-device", 2, "Other Phones")
+        self.mpv.wait_for(lambda: self.devices() == ["Friend, Pro", "Other Phones"])
+        self.graph_has("volume=-6dB[l]", "volume=0dB[r]")
+        self.assertNotIn("adelay", self.mpv.get("lavfi-complex"))
+        self.mpv.wait_for(lambda: abs(self.mpv.get("time-pos") - 3.0) < 0.05)
+        with open(os.path.join(self.tmp.name, "devices.json")) as f:
+            self.assertEqual(json.load(f), {"Friend, Pro": {"gain": -6, "delay": 0},
+                                            "Nikita’s AirPods": {"gain": 0, "delay": 120}})
 
     def test_dropout_and_back(self):
         self.mpv.command("set_property", "pause", False)
@@ -560,7 +732,7 @@ class FollowSubs(Playing):
         self.shows("Eng", "Rus")
         self.mpv.command("script-binding", "dual_audio/follow-subs")
         self.shows("Eng", None)
-        self.assertFalse(self.state()["follow_subs"])
+        self.mpv.wait_for(lambda: not self.state()["follow_subs"])  # published just after
         self.mpv.command("script-binding", "dual_audio/follow-subs")
         self.shows("Eng", "Rus")
         self.expect((1, 2))         # still at 3.0s
@@ -671,9 +843,12 @@ class Menu(unittest.TestCase):
 
     def test_clicks(self):
         # Clicks the real menu items and checks the graph.
-        out = subprocess.run([self.harness(), TONES, SCRIPT], capture_output=True, text=True, timeout=60)
+        devices = os.path.join(self.tmp.name, "clicks.json")
+        out = subprocess.run([self.harness(), TONES, SCRIPT, devices], capture_output=True, text=True, timeout=60)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("ok dual audio off", out.stdout)
+        with open(devices) as f:  # the loudness click, remembered
+            self.assertEqual(json.load(f), {"system output (right ear)": {"gain": 1, "delay": 0}})
 
     def test_device_menu(self):
         # Under dualplay -2 (the helper set) each pair's Device row lists the
@@ -703,7 +878,8 @@ class Menu(unittest.TestCase):
         helper, calls = fake_helper(self.tmp.name)
         outputs = self.outputs("Pair A", "Pair B", "Other Phones")
         log = os.path.join(self.tmp.name, "clicks.log")
-        out = subprocess.run([self.harness(), TONES, SCRIPT, helper, log], capture_output=True,
+        devices = os.path.join(self.tmp.name, "clicks.json")
+        out = subprocess.run([self.harness(), TONES, SCRIPT, devices, helper, log], capture_output=True,
                              text=True, timeout=60, env=dict(os.environ, BUBBATV_DEVICES=outputs))
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(calls(), ["create|Pair A|Other Phones", "create|Other Phones|Pair A"])
