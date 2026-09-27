@@ -7,7 +7,8 @@
 --             when those are two devices combined (see tools/audio-pairs.swift).
 --
 -- Built on mpv's --lavfi-complex, which can decode several audio tracks of
--- the same file simultaneously.
+-- the same file simultaneously. Each side's loudness and delay are in a
+-- labelled --af filter after it, where they change live (see adjust).
 --
 -- Keys (rebind in input.conf with `KEY script-binding dual_audio/<name>`):
 --   a  toggle          y  swap
@@ -150,37 +151,105 @@ local function remember(tracks)
     pref.same = left == right
 end
 
--- adelay only holds a side back, so it holds back the later side by the
--- difference, and asetpts moves the whole output by the earlier side's
--- delay, either way. Not mpv's audio-delay: mpv writes that into
--- watch-later files (inside the quit command, with no event before it),
--- and the next start would be off by the shift.
-local function base_delay() return math.min(delay[1], delay[2]) end
-
-local function input(src, side, pad)
-    local d = delay[side] - base_delay()
-    return string.format("%saresample=48000,aformat=channel_layouts=%s,%svolume=%gdB[%s];",
-        src, pairs_mode and "stereo" or "mono",
-        d > 0 and string.format("adelay=%d:all=1,", d) or "", gain[side], pad)
+local function input(src, pad)
+    return string.format("%saresample=48000,aformat=channel_layouts=%s[%s];",
+        src, pairs_mode and "stereo" or "mono", pad)
 end
 
+-- The tracks, joined: ears FL | FR, pairs FL FR | BL BR.
 local function graph()
     local l, r = "[aid" .. left .. "]", "[aid" .. right .. "]"
     local split = ""
     -- A track feeds only one filter, so split it when both sides play it.
     if left == right then split, l, r = l .. "asplit=2[sl][sr];", "[sl]", "[sr]" end
-    local g = split .. input(l, 1, "l") .. input(r, 2, "r")
-    -- join takes its timestamps from its first input, and adelay's leading
-    -- silence has none: mpv would then misplace both sides against the
-    -- picture. So the side held back goes in second.
-    local ins, a, b = "[l][r]", 0, 1  -- join inputs; which one is l, which r
-    if delay[1] > delay[2] then ins, a, b = "[r][l]", 1, 0 end
-    local out = base_delay() ~= 0 and string.format(",asetpts=PTS%+g/TB", base_delay() / 1000) or ""
+    local g = split .. input(l, "l") .. input(r, "r")
     if pairs_mode then
-        return g .. string.format("%sjoin=inputs=2:channel_layout=quad:map=%d.0-FL|%d.1-FR|%d.0-BL|%d.1-BR%s[ao]",
-            ins, a, a, b, b, out)
+        return g .. "[l][r]join=inputs=2:channel_layout=quad:map=0.0-FL|0.1-FR|1.0-BL|1.1-BR[ao]"
     end
-    return g .. string.format("%sjoin=inputs=2:channel_layout=stereo:map=%d.0-FL|%d.0-FR%s[ao]", ins, a, b, out)
+    return g .. "[l][r]join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR[ao]"
+end
+
+-- Output channels in order; the first half is side 1's.
+local channels = pairs_mode and { "FL", "FR", "BL", "BR" } or { "FL", "FR" }
+local function side_of(c) return c <= #channels / 2 and 1 or 2 end
+
+-- adelay only holds a side back, so it holds back the later side by the
+-- difference, and asetpts moves the whole output by the earlier side's
+-- delay, either way. Not mpv's audio-delay: mpv writes that into
+-- watch-later files (inside the quit command, with no event before it),
+-- and the next start would be off by the shift. The earlier side stays
+-- undelayed: were every channel held back, adelay would start with silence
+-- that has no timestamps.
+local function base_delay() return math.min(delay[1], delay[2]) end
+
+-- adelay's "delays": ms per output channel.
+local function delays()
+    local list = {}
+    for c = 1, #channels do list[c] = delay[side_of(c)] - base_delay() end
+    return table.concat(list, "|")
+end
+
+-- asetpts's "expr".
+local function shift() return string.format("PTS%+g/TB", base_delay() / 1000) end
+
+-- Loudness and delay on the joined channels, as a labelled --af filter:
+-- af-command reaches filters there, not those inside lavfi-complex. The
+-- channels of one side share the name volume@dual_audioN, so one command
+-- sets them all.
+local function af_graph()
+    local layout = pairs_mode and "quad" or "stereo"
+    local outs, volumes, ins, map = "", "", "", {}
+    for c, name in ipairs(channels) do
+        outs = outs .. "[c" .. c .. "]"
+        volumes = volumes .. string.format("[c%d]volume@dual_audio%d=%gdB[v%d];",
+            c, side_of(c), gain[side_of(c)], c)
+        ins = ins .. "[v" .. c .. "]"
+        map[c] = (c - 1) .. ".0-" .. name
+    end
+    return string.format("channelsplit=channel_layout=%s%s;%s%sjoin=inputs=%d:channel_layout=%s:map=%s,"
+        .. "adelay@dual_audio=delays=%s,asetpts@dual_audio=%s", layout, outs, volumes, ins, #channels, layout,
+        table.concat(map, "|"), delays(), shift())
+end
+
+-- Our --af graph as mpv has it, nil if none. Looked up rather than kept:
+-- mpv saves the --af list in watch-later files and sets it again when it
+-- resumes, and the user can change the list too.
+local function installed()
+    for _, f in ipairs(mp.get_property_native("af", {})) do
+        if f.label == "dual_audio" then return f.params and f.params.graph end
+    end
+end
+
+-- Installs our --af filter in front of the user's own (they are left as
+-- they are), updates it, or takes it out. mpv replaces a filter whose
+-- string changes, losing the audio it holds, so this happens only when the
+-- sound breaks anyway: graph changes, seeks and a reopened audio output.
+local function set_af(want)
+    local g = want and af_graph() or nil
+    if g == installed() then return end
+    if g then
+        mp.commandv("af", "pre", "@dual_audio:lavfi=[" .. g .. "]")
+    else
+        mp.commandv("af", "remove", "@dual_audio")
+    end
+end
+
+-- Loudness and delay changes: sent to the running --af filter, so they are
+-- heard at once, with no graph rebuild and no seek. A new shift moves the
+-- sound against the picture, which then slows down or speeds up for a
+-- moment to catch up. The filter's string still has the old values; it
+-- catches up when mpv empties the filter anyway (see catch_up).
+local function adjust()
+    local ok = true
+    local function send(cmd, arg, target)
+        ok = mp.commandv("af-command", "dual_audio", cmd, arg, target) and ok
+    end
+    for i = 1, 2 do send("volume", string.format("%gdB", gain[i]), "volume@dual_audio" .. i) end
+    send("delays", delays(), "adelay@dual_audio")
+    send("expr", shift(), "asetpts@dual_audio")
+    -- mpv builds the filter when audio first reaches it; until then there
+    -- is nothing in it to lose, so the new string can go in straight away.
+    if not ok then set_af(true) end
 end
 
 local function label(tracks, id)
@@ -339,10 +408,17 @@ end
 local function apply(live)
     local tracks = audio_tracks()
     local want = enabled and #tracks >= 2
-    if not want and not ours then return publish() end
+    if not want and not ours then
+        set_af(false)  -- there may be one from a watch-later file
+        return publish()
+    end
     if want and not (by_id(tracks, left) and by_id(tracks, right)) then pick(tracks) end
     local pos = live and mp.get_property_number("time-pos")
+    -- Our --af filter goes in after the graph and out before it, so it only
+    -- ever gets the joined channels.
+    if not want then set_af(false) end
     mp.set_property("lavfi-complex", want and graph() or "")
+    if want then set_af(true) end
     ours = want
     -- Back to normal playback: keep the left-ear / first-pair language.
     if not want and left then mp.set_property_number("aid", left) end
@@ -412,6 +488,13 @@ local function swap()
     show()
 end
 
+-- New loudness or delay: live while dual audio is on, otherwise kept for
+-- when it is.
+local function tune()
+    if ours then adjust() end
+    publish()
+end
+
 -- h / k: make one side louder than the other - by bringing it back up if
 -- it is below 0 dB, otherwise by turning the other side down.
 local function nudge(side)
@@ -422,7 +505,7 @@ local function nudge(side)
         gain[3 - side] = gain[3 - side] - opts.balance_step
     end
     save()
-    apply(true)
+    tune()
     show()
 end
 
@@ -441,17 +524,15 @@ local setters = {
         if not (ours and by_id(tracks, id)) then return false end
         if i == 1 then left = id else right = id end
         remember(tracks)
+        apply(true)
     end,
-    ["set-gain"] = function(i, db) gain[i] = db; save() end,
-    ["set-delay"] = function(i, ms) delay[i] = math.floor(ms + 0.5); save() end,
+    ["set-gain"] = function(i, db) gain[i] = db; save(); tune() end,
+    ["set-delay"] = function(i, ms) delay[i] = math.floor(ms + 0.5); save(); tune() end,
 }
 for name, set in pairs(setters) do
     mp.register_script_message(name, function(side, value)
         local i, v = tonumber(side), tonumber(value)
-        if (i == 1 or i == 2) and v and set(i, v) ~= false then
-            apply(true)
-            if ours then show() end
-        end
+        if (i == 1 or i == 2) and v and set(i, v) ~= false and ours then show() end
     end)
 end
 
@@ -473,9 +554,13 @@ local function run_queue()
                 local first, second = r.stdout:match("^[^\t]*\t([^\t]*)\t([^\t\n]*)")
                 devices = { first or names[1], second or names[2] }
                 lost = {}
+                -- Other headphones bring their own loudness and delay. The
+                -- reopened output gets our filter built anew from its
+                -- string, so that has them, and any live changes, first.
+                restore()
+                if ours then set_af(true) end
                 mp.commandv("ao-reload")
-                -- Other headphones bring their own loudness and delay.
-                if restore() and ours then apply(true) else publish() end
+                publish()
                 job.done()
             else
                 local why = (r and r.stderr or ""):gsub("^audio%-pairs: ", ""):gsub("%s+$", "")
@@ -554,9 +639,20 @@ end)
 -- which in ears mode brings its own saved settings.
 mp.observe_property("track-list", nil, publish)
 mp.observe_property("audio-device", nil, function()
-    if restore() and ours then apply(true) else publish() end
+    if restore() then tune() else publish() end
 end)
 for _, prop in ipairs(sub_props) do mp.observe_property(prop, "number", subs_changed) end
+
+-- mpv builds the --af filter anew from its string after a seek and when it
+-- reopens the audio output (another output device, ao-reload), with nothing
+-- in the old one to lose: the moments to write live changes into the
+-- string. Should mpv get sound through before this runs, that moment still
+-- has the old values.
+local function catch_up()
+    if ours then set_af(true) end
+end
+mp.register_event("seek", catch_up)
+mp.register_event("audio-reconfig", catch_up)
 
 -- Pairs mode on an ordinary stereo device folds channels 3-4 into 1-2, so
 -- everyone hears both languages. Say so instead of leaving it a mystery.

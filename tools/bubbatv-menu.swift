@@ -162,10 +162,9 @@ func watchOutputs(_ changed: @escaping @MainActor () -> Void) {
     }
 }
 
-/// A menu row "Loudness  − ━━━●━━━ +  -2 dB". The text follows the knob;
-/// the value goes out a moment after the last change, as each change
-/// rebuilds the audio graph (a short gap in the sound). Clicking the value
-/// resets it to 0.
+/// A menu row "Loudness  − ━━━●━━━ +  -2 dB". The text follows the knob,
+/// and each new value goes out at once: dual_audio.lua applies it live, so
+/// a drag is heard as it goes. Clicking the value resets it to 0.
 final class SliderRow: NSView {
     private let title: String
     private let unit: String
@@ -173,7 +172,7 @@ final class SliderRow: NSView {
     private let send: (Double) -> Void
     private let slider = NSSlider()
     private let value = NSButton(title: "", target: nil, action: nil)
-    private var timer: Timer?
+    private var sent: Double
 
     init(_ title: String, _ range: ClosedRange<Double>, step: Double, unit: String,
          value v: Double, send: @escaping (Double) -> Void) {
@@ -181,6 +180,7 @@ final class SliderRow: NSView {
         self.unit = unit
         self.step = step
         self.send = send
+        sent = v
         super.init(frame: NSRect(x: 0, y: 0, width: 340, height: 28))
         let font = NSFont.menuFont(ofSize: 0)
         let label = NSTextField(labelWithString: title)
@@ -222,11 +222,11 @@ final class SliderRow: NSView {
         let v = min(max((v / step).rounded() * step, slider.minValue), slider.maxValue)
         slider.doubleValue = v
         show(v)
-        timer?.invalidate()
-        // The menu is being tracked while it is open: .common includes that run loop mode.
-        let t = Timer(timeInterval: 0.35, repeats: false) { [send] _ in send(v) }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
+        // A drag moves the knob by less than a step at a time.
+        if v != sent {
+            sent = v
+            send(v)
+        }
     }
 
     @objc private func moved() { change(to: slider.doubleValue) }
