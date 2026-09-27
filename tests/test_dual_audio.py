@@ -176,17 +176,20 @@ class Keys(unittest.TestCase):
 
     def test_toggle_cycle_swap(self):
         self.press("a", (1, 2))     # on: current track left, next right
-        self.press("]", (1, 3))     # right ear -> next track
-        self.press("]", (1, 2))     # wraps around, skipping the left ear's track
-        self.press("[", (3, 2))     # left ear -> next free track
-        self.assertEqual(self.mpv.get("speed"), 1)  # [ ] no longer change the speed
+        self.press("}", (1, 3))     # right ear -> next track
+        self.press("}", (1, 2))     # wraps around, skipping the left ear's track
+        self.press("{", (3, 2))     # left ear -> next free track
+        self.assertEqual(self.mpv.get("speed"), 1)  # { } no longer change the speed
+        self.mpv.command("keypress", "]")  # plain ] is mpv's speed key again
+        self.mpv.wait_for(lambda: self.mpv.get("speed") > 1)
+        self.expect((3, 2))         # ... and leaves the tracks alone
         self.press("y", (2, 3))     # swap
         self.press("a", None)       # off
         self.assertEqual(self.mpv.get("aid"), 2)  # left-ear language keeps playing
 
     def test_choice_carries_to_next_file(self):
         self.press("a", (1, 2))
-        self.press("]", (1, 3))
+        self.press("}", (1, 3))
         self.mpv.command("playlist-next")
         self.mpv.wait_for(lambda: self.mpv.get("playlist-pos") == 1)
         self.expect((1, 3))
