@@ -5,6 +5,7 @@ Run: python3 tests/test_dual_audio.py   (needs mpv + ffmpeg; builds samples if m
 """
 import json
 import os
+import plistlib
 import re
 import shutil
 import socket
@@ -532,6 +533,152 @@ class Menu(unittest.TestCase):
         out = subprocess.run([harness, TONES, SCRIPT], capture_output=True, text=True, timeout=60)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("ok dual audio off", out.stdout)
+
+
+class App(unittest.TestCase):
+    """bubbaTV.app, built by tools/make-app.sh. --dry-run prints the dualplay
+    command it would run. The dry runs use a copy of the app pointed at a fake
+    dualplay, whose -L prints the outputs each test needs."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("swiftc"):
+            raise unittest.SkipTest("needs swiftc")
+        cls.build = tempfile.TemporaryDirectory()
+        cls.app = os.path.join(cls.build.name, "bubbaTV.app")
+        # Built from a shell without Homebrew in its PATH: the app still finds mpv.
+        cls.path = "/usr/bin:/bin:" + os.path.join(cls.build.name, "bin")
+        subprocess.run([os.path.join(ROOT, "tools", "make-app.sh"), cls.app], env=dict(os.environ, PATH=cls.path),
+                       check=True, capture_output=True, timeout=300)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.build.cleanup()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.fake = os.path.join(self.tmp.name, "dualplay")
+        with open(self.fake, "w") as f:  # -L prints dualplay.outputs and keeps its PATH in dualplay.path
+            f.write('#!/bin/sh\n[ "$1" = -L ] || exit 1\necho "$PATH" > "$0.path"\ncat "$0.outputs"\n')
+        os.chmod(self.fake, 0o755)
+        self.outputs("  MacBook Pro Speakers (2 ch)")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def outputs(self, *lines):
+        with open(self.fake + ".outputs", "w") as f:
+            f.write("".join(line + "\n" for line in lines))
+
+    def info(self):
+        with open(os.path.join(self.app, "Contents", "Info.plist"), "rb") as f:
+            return plistlib.load(f)
+
+    def dry_run(self, *files, **keys):
+        """The app's dry run, with BubbaTV* Info.plist keys set (dualplay: the fake)."""
+        app = os.path.join(self.tmp.name, "bubbaTV.app")
+        if not os.path.exists(app):
+            shutil.copytree(self.app, app, symlinks=True)
+        for key, value in dict({"Dualplay": self.fake}, **keys).items():
+            subprocess.run(["plutil", "-replace", "BubbaTV" + key, "-string", value,
+                            os.path.join(app, "Contents", "Info.plist")], check=True)
+        return subprocess.run([os.path.join(app, "Contents", "MacOS", "bubbaTV"), "--dry-run", *files],
+                              capture_output=True, text=True, timeout=60)
+
+    def test_bundle(self):
+        subprocess.run(["plutil", "-lint", os.path.join(self.app, "Contents", "Info.plist")],
+                       check=True, capture_output=True)
+        # Signed as a whole, so nothing may be written into it: dualplay builds in tools/.build.
+        subprocess.run(["codesign", "--verify", "--strict", self.app], check=True, capture_output=True)
+        info = self.info()
+        self.assertTrue(os.access(os.path.join(self.app, "Contents", "MacOS", info["CFBundleExecutable"]), os.X_OK))
+        self.assertEqual(info["BubbaTVDualplay"], os.path.join(ROOT, "dualplay"))
+        self.assertEqual(info["BubbaTVPath"], self.path + ":/opt/homebrew/bin:/usr/local/bin")
+        # Offered for movies, never their default app.
+        types = info["CFBundleDocumentTypes"]
+        self.assertEqual({t["LSHandlerRank"] for t in types}, {"Alternate"})
+        self.assertLessEqual({"public.movie", "org.matroska.mkv", "org.webmproject.webm"},
+                             {u for t in types for u in t["LSItemContentTypes"]})
+        self.assertEqual({t["UTTypeIdentifier"] for t in info["UTImportedTypeDeclarations"]},
+                         {"org.matroska.mkv", "org.webmproject.webm"})
+
+    def test_rebuild_replaces_only_bubbatv(self):
+        # make-app.sh builds over an older bubbaTV, even one whose build failed,
+        # but not over another app given by mistake.
+        def make(app, path=os.environ["PATH"]):
+            return subprocess.run([os.path.join(ROOT, "tools", "make-app.sh"), app], env=dict(os.environ, PATH=path),
+                                  capture_output=True, text=True, timeout=300)
+        old = os.path.join(self.tmp.name, "old", "bubbaTV.app")
+        shutil.copytree(self.app, old, symlinks=True)
+        out = make(old)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        broken = os.path.join(self.tmp.name, "broken")  # a swiftc that fails
+        os.makedirs(broken)
+        with open(os.path.join(broken, "swiftc"), "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(os.path.join(broken, "swiftc"), 0o755)
+        self.assertEqual(make(old, broken + ":/usr/bin:/bin").returncode, 1)
+        out = make(old)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        other = os.path.join(self.tmp.name, "Other.app", "Contents", "Info.plist")
+        os.makedirs(os.path.dirname(other))
+        with open(other, "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.other"}, f)
+        out = make(os.path.join(self.tmp.name, "Other.app"))
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("is not bubbaTV", out.stderr)
+        self.assertTrue(os.path.exists(other))
+
+    def test_two_pairs_with_two_bluetooth_outputs(self):
+        for bluetooth, pairs in ((0, ""), (1, ""), (2, "-2 "), (3, "")):
+            self.outputs("  MacBook Pro Speakers (2 ch)",
+                         *("  AirPods %d (2 ch, Bluetooth)" % i for i in range(bluetooth)))
+            out = self.dry_run(TONES)
+            self.assertEqual((out.returncode, out.stdout), (0, "%s %s%s\n" % (self.fake, pairs, TONES)))
+
+    def test_dualplay_gets_the_baked_path(self):
+        path = os.path.dirname(shutil.which("mpv")) + ":/usr/bin:/bin"
+        self.assertEqual(self.dry_run(TONES, Path=path).returncode, 0)
+        with open(self.fake + ".path") as f:
+            self.assertEqual(f.read(), path + "\n")
+
+    def test_files_in_episode_order(self):
+        # Several files make a playlist; the dry run quotes them for the shell.
+        d = self.tmp.name
+        out = self.dry_run(*(os.path.join(d, n) for n in ("Episode 10.mkv", "Episode 2.mkv", "it's 1.mkv")))
+        self.assertEqual(out.stdout, "%s '%s/Episode 2.mkv' '%s/Episode 10.mkv' '%s/it'\\''s 1.mkv'\n"
+                         % (self.fake, d, d, d))
+
+    def test_nothing_to_play(self):
+        out = self.dry_run()
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("Nothing to play", out.stderr)
+
+    def test_mpv_missing(self):
+        out = self.dry_run(TONES, Path="/usr/bin:/bin")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("mpv is not installed", out.stderr)
+        self.assertIn("brew install mpv", out.stderr)
+
+    def test_dualplay_missing(self):
+        out = self.dry_run(TONES, Dualplay=os.path.join(self.tmp.name, "moved", "dualplay"))
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("tools/make-app.sh", out.stderr)
+
+    def test_real_dualplay_lists_outputs(self):
+        # dualplay -L builds the helper (here in a copy of the checkout) and
+        # lists the outputs without mpv or a file; the app runs it the same way.
+        repo = os.path.join(self.tmp.name, "repo")
+        os.makedirs(os.path.join(repo, "tools"))
+        shutil.copy(os.path.join(ROOT, "dualplay"), repo)
+        shutil.copy(os.path.join(ROOT, "tools", "audio-pairs.swift"), os.path.join(repo, "tools"))
+        out = subprocess.run([os.path.join(repo, "dualplay"), "-L"], capture_output=True, text=True,
+                             timeout=300, env=dict(os.environ, PATH="/usr/bin:/bin"))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        for line in out.stdout.splitlines():
+            self.assertRegex(line, r"^  .+ \(\d+ ch(, Bluetooth)?\)$")
+        out = self.dry_run(TONES, Dualplay=os.path.join(repo, "dualplay"))
+        self.assertRegex(out.stdout, "^%s (-2 )?%s\n$" % (re.escape(os.path.join(repo, "dualplay")), re.escape(TONES)))
 
 
 if __name__ == "__main__":
