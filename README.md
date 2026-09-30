@@ -296,7 +296,7 @@ ln -s "$PWD/tools/.build/bubbatv.so" ~/.config/mpv/scripts/
 Optional defaults in `~/.config/mpv/script-opts/dual_audio.conf`:
 
 ```ini
-# turn on for every file with 2+ audio tracks (comments need their own line)
+# turn on for every file with 2+ audio tracks, 1+ with two pairs (comments need their own line)
 auto=yes
 left_lang=eng,en
 right_lang=rus,ru

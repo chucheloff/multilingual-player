@@ -142,6 +142,15 @@ class Render(unittest.TestCase):
         self.assertEqual(self.render("--script-opts=dual_audio-auto=yes",
                                      "--audio-channels=stereo", src=single), [1000, 1000])
 
+    def test_pairs_mode_single_track_on_both_pairs(self):
+        # Played as it is, a single track reached only channels 1-2: the
+        # second pair heard nothing.
+        single = os.path.join(self.tmp.name, "single.mkv")
+        subprocess.run(["ffmpeg", "-v", "error", "-i", TONES, "-map", "0:v", "-map", "0:a:0",
+                        "-c", "copy", single], check=True)
+        self.assertEqual(self.render("--script-opts=dual_audio-auto=yes,dual_audio-mode=pairs",
+                                     "--audio-channels=quad", src=single), [440, 440, 440, 440])
+
     def test_pairs_mode_stereo_per_pair(self):
         # Channels 1-2 -> first headphone pair, 3-4 -> second.
         self.assertEqual(self.render("--script-opts=dual_audio-auto=yes,dual_audio-mode=pairs",
