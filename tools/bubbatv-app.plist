@@ -40,7 +40,7 @@
 				<string>org.webmproject.webm</string>
 			</array>
 		</dict>
-		<!-- A folder of episodes: dualplay plays its .mkv files. -->
+		<!-- A folder of episodes: dualplay plays its videos. -->
 		<dict>
 			<key>CFBundleTypeName</key>
 			<string>Folder</string>

@@ -24,6 +24,7 @@ MENU = os.path.join(ROOT, "tools", "bubbatv-menu.swift")
 DUALPLAY = os.path.join(ROOT, "dualplay")
 TONES = os.path.join(ROOT, "samples", "tones.mkv")  # 1=eng 440Hz, 2=rus 1000Hz 5.1, 3=ger 2500Hz
 SYNC = os.path.join(ROOT, "samples", "sync.mkv")    # both tracks beep for 0.1 s once a second
+VIDEOS = (".mkv", ".mp4", ".m4v", ".mov", ".avi", ".webm")  # what dualplay plays from a folder
 BASE = ["mpv", "--no-config", "--script=" + SCRIPT, "--vo=null", "--really-quiet"]
 
 
@@ -70,9 +71,11 @@ def af_graph(mpv):
 
 
 def episode(path):
-    """A short copy of the tones (5 s) at path, standing in for an episode."""
+    """A short copy of the tones (5 s) at path, standing in for an episode.
+    Matroska whatever the extension: mpv goes by the content."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    subprocess.run(["ffmpeg", "-v", "error", "-i", TONES, "-map", "0", "-t", "5", "-c", "copy", path], check=True)
+    subprocess.run(["ffmpeg", "-v", "error", "-i", TONES, "-map", "0", "-t", "5", "-c", "copy", "-f", "matroska", path],
+                   check=True)
     return path
 
 
@@ -1505,7 +1508,7 @@ class Dualplay(unittest.TestCase):
 
 class Folders(unittest.TestCase):
     """dualplay with folders of episodes (a copy, see dualplay_copy): each
-    becomes its .mkv files in episode order, and mpv gets the whole playlist
+    becomes its videos in episode order, and mpv gets the whole playlist
     up front."""
 
     def setUp(self):
@@ -1522,12 +1525,12 @@ class Folders(unittest.TestCase):
         self.tmp.cleanup()
 
     def folder(self, name, *files):
-        """A folder with these files ("Extras/x.mkv" in a subfolder): .mkv
-        ones are short episodes, the others (and hidden ones) empty."""
+        """A folder with these files ("Extras/x.mkv" in a subfolder): videos
+        are short episodes, the others (and hidden ones) empty."""
         path = os.path.join(self.tmp.name, name)
         os.makedirs(path)
         for f in files:
-            if f.lower().endswith(".mkv") and not os.path.basename(f).startswith("."):
+            if f.lower().endswith(VIDEOS) and not os.path.basename(f).startswith("."):
                 episode(os.path.join(path, f))
             else:
                 open(os.path.join(path, f), "w").close()
@@ -1550,6 +1553,15 @@ class Folders(unittest.TestCase):
         self.mpv.wait_for(lambda: (self.mpv.get("user-data/dual_audio") or {}).get("active"))
         self.assertEqual(self.mpv.get("user-data/dual_audio")["sides"][0]["track"], 3)
 
+    def test_other_video_types(self):
+        # .mp4 and the rest too, mixed in one episode order; subtitles and
+        # other files still stay out.
+        season = self.folder("Season 2", "E05.mp4", "E05.srt", "E01.MP4", "E03.mov", "E02.m4v", "E04.avi",
+                             "E06.webm", "E07.mkv", "cover.jpg", "._E08.mp4")
+        self.assertEqual(self.play(season),
+                         [os.path.join(season, n) for n in ("E01.MP4", "E02.m4v", "E03.mov", "E04.avi", "E05.mp4",
+                                                            "E06.webm", "E07.mkv")])
+
     def test_folders_and_files(self):
         # Each folder's episodes take its place; the arguments keep their order.
         s1, s2 = self.folder("S1", "E2.mkv", "E1.mkv"), self.folder("S2", "E10.mkv", "E9.mkv")
@@ -1557,13 +1569,13 @@ class Folders(unittest.TestCase):
         self.assertEqual(self.play(s2, movie, s1), [os.path.join(s2, "E9.mkv"), os.path.join(s2, "E10.mkv"), movie,
                                                     os.path.join(s1, "E1.mkv"), os.path.join(s1, "E2.mkv")])
 
-    def test_no_mkv_files(self):
+    def test_no_videos(self):
         # A clear error before anything starts: with -2 not even the device.
-        show = self.folder("Show", "notes.txt", "._Episode 1.mkv", "Season 1/Episode 1.mkv")
+        show = self.folder("Show", "notes.txt", "Episode 1.srt", "._Episode 1.mp4", "Season 1/Episode 1.mkv")
         out = subprocess.run([os.path.join(self.root, "dualplay"), "-2", show, "--no-config"],
                              capture_output=True, text=True, timeout=60, env=self.env)
         self.assertEqual((out.returncode, out.stderr),
-                         (1, "dualplay: no .mkv files in %s (its subfolders are not searched)\n" % show))
+                         (1, "dualplay: no videos in %s (its subfolders are not searched)\n" % show))
         self.assertEqual(self.calls(), [])
 
 

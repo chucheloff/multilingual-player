@@ -32,9 +32,9 @@ the file name, e.g. `--sub-lang=eng`.
 
 ## A folder of episodes
 
-Give `dualplay` a folder instead of a file and it plays the folder's `.mkv`
-files (`.MKV` too) one after another, in episode order: "Episode 2" before
-"Episode 10". The next episode keeps the languages you chose, and the bubbaTV
+Give `dualplay` a folder instead of a file and it plays the folder's videos
+(`.mkv`, `.mp4`, `.m4v`, `.mov`, `.avi`, `.webm`, in any case) one after
+another, in episode order: "Episode 2" before "Episode 10". The next episode keeps the languages you chose, and the bubbaTV
 menu's [Playback](#the-bubbatv-menu) section steps through them.
 
 - Only the folder itself is searched, not its subfolders: in a season folder
@@ -43,8 +43,10 @@ menu's [Playback](#the-bubbatv-menu) section steps through them.
   `./dualplay "Season 1" "Season 2"`.
 - Several folders and files work, in the order given: `./dualplay "Season 1" special.mkv`.
 - Hidden files are left out, such as the `._Episode 1.mkv` copies macOS
-  leaves on USB drives, and so are other files (subtitles, `.mp4`, notes).
-- A folder without `.mkv` files stops `dualplay` with an error saying so.
+  leaves on USB drives, and so are other files (subtitles, notes, covers).
+  Subtitles named like their episode (`Episode 1.srt` next to
+  `Episode 1.mp4`) still show: mpv loads them along with the episode.
+- A folder without videos stops `dualplay` with an error saying so.
 - Files and folders come first, mpv options after them: from the first
   argument starting with `-`, everything goes to mpv as it is.
 
