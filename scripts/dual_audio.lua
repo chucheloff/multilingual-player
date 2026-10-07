@@ -45,7 +45,7 @@ local options = require "mp.options"
 local utils = require "mp.utils"
 
 local opts = {
-    auto = false,       -- turn on automatically for files with 2+ audio tracks
+    auto = false,       -- turn on automatically for files with 2+ audio tracks (1+ in pairs mode)
     mode = "ears",      -- "ears" or "pairs" (see above)
     left_lang = "",     -- preferred languages for the left ear / first pair, e.g. "eng,en"
     right_lang = "",    -- preferred languages for the right ear / second pair, e.g. "rus,ru"
@@ -61,6 +61,10 @@ local opts = {
 }
 options.read_options(opts, "dual_audio")
 local pairs_mode = opts.mode == "pairs"
+-- A file with one track still needs the graph in pairs mode: played as it
+-- is, it would reach only the first pair (channels 1-2 of the 4). With one
+-- pair, one track plays as it is, in both ears.
+local min_tracks = pairs_mode and 1 or 2
 
 local side_names = pairs_mode and { "Pair 1", "Pair 2" } or { "Left ear", "Right ear" }
 local sides_word = pairs_mode and "pairs" or "ears"
@@ -546,7 +550,7 @@ local hint = mp.create_osd_overlay("ass-events")  -- on screen while calibrating
 -- the re-read first, then seek to the exact position.
 local function apply(live)
     local tracks = audio_tracks()
-    local want = enabled and #tracks >= 2
+    local want = enabled and #tracks >= min_tracks
     -- A new graph ends calibrating: the movie comes back as it was then.
     local back = calib
     calib = nil
@@ -600,7 +604,7 @@ local function show()
     if not enabled then
         text = "Dual audio: off"
     elseif not ours then
-        text = "Dual audio: needs 2+ audio tracks, this file has " .. #tracks
+        text = string.format("Dual audio: needs %d+ audio tracks, this file has %d", min_tracks, #tracks)
     else
         text = string.format("Dual audio\n%s: %s%s\n%s: %s%s",
             devices[1] or side_names[1], label(tracks, left), tweaks(1),

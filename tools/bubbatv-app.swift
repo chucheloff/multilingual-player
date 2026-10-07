@@ -1,6 +1,6 @@
 // bubbaTV.app - play a movie with dualplay, no terminal needed: drop it on
 // the app (Dock or Finder) or use Open With > bubbaTV. A folder of episodes
-// works the same way: dualplay plays its .mkv files. tools/make-app.sh
+// works the same way: dualplay plays its videos. tools/make-app.sh
 // builds it and bakes two things into its Info.plist: where dualplay is (this
 // checkout) and the PATH to find mpv with. The languages come from
 // dual_audio.conf, as with dualplay itself.
