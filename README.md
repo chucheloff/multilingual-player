@@ -8,9 +8,11 @@ Watch a movie with a friend in two languages at once, on one Mac:
 It's a plugin for [mpv](https://mpv.io) (`scripts/dual_audio.lua`) plus a
 small launcher (`dualplay`), with a **bubbaTV** menu in mpv's menu bar for
 each pair's headphones, track, loudness and delay, and subtitles in both
-languages. Loudness and delay are remembered per headphones, and a sync
+languages. Tracks, language preferences, loudness and delay are remembered
+per headphones, and a sync
 pattern helps set the delays. `←` / `→` go back and forth exactly 5 seconds,
-to hear a line again, and a folder of episodes plays one after another. The
+to hear a line again, as do left/right mouse double-clicks, and a folder of
+episodes plays one after another. The
 **bubbaTV** app starts a movie without the terminal.
 
 ## Quick start
@@ -35,7 +37,9 @@ the file name, e.g. `--sub-lang=eng`.
 Give `dualplay` a folder instead of a file and it plays the folder's `.mkv`
 files (`.MKV` too) one after another, in episode order: "Episode 2" before
 "Episode 10". The next episode keeps the languages you chose, and the bubbaTV
-menu's [Playback](#the-bubbatv-menu) section steps through them.
+menu's [Playback](#the-bubbatv-menu) section steps through them. A manually
+chosen dub is remembered for that file and season folder, per headphones;
+its title and language are matched in the next episode even if track IDs change.
 
 - Only the folder itself is searched, not its subfolders: in a season folder
   those hold extras, featurettes and samples, which would otherwise play
@@ -126,6 +130,8 @@ dual audio on it has a group per pair (or ear):
 - **Audio track** — the track it plays; pick any, the other pair's too
 - **Loudness** — −30 … +6 dB, on top of mpv's volume
 - **Delay** — −1000 … +1000 ms, on top of mpv's audio delay (`Ctrl+-` / `Ctrl++`)
+- **Preferred language** — Automatic, English (`en` / `eng`), or Russian
+  (`ru` / `rus`), saved for these headphones across launches and movies
 
 plus switches for dual audio on/off, **Calibrate delay…**
 ([below](#calibrating-the-delays)), swapping the pairs and
@@ -212,6 +218,32 @@ file name.
 
 ## Remembered per headphones
 
+**Audio tracks:** a manual track pick, including the cycling and swap keys,
+is saved per headphones in `~/.config/mpv/dual_audio-tracks.json`.
+The player's selection order is:
+
+1. The headphones' manual pick for this exact file.
+2. Their pick for this season folder (or, for a playlist spanning folders,
+   the same ordered playlist), if it agrees with their preferred language.
+3. Their **Preferred language**, then the launcher's `-l` / `-r` defaults
+   when no device preference is set.
+4. The file's normal audio track and another available track.
+
+Episode matching uses the language and dub title before its position within
+that language; track IDs are used only to identify a pick in the same file.
+This also remembers untagged tracks and lets both devices share one track.
+If the requested language is absent, playback falls back to available audio
+without replacing the saved choice. Moving headphones to the other pair
+brings their track choice with them.
+
+Choose **Preferred language** once under each pair in the bubbaTV menu.
+Changing it clears that device's picks for the current file and playlist
+and selects the language immediately when available. A later manual pick
+can override it for a file. **Automatic** removes the device language
+preference. Choices follow device names, so keep the headphones' names
+distinct. `tracks_file=` disables saving; with `--no-config` the default
+store lasts only until mpv quits, unless an explicit path is supplied.
+
 A pair's loudness and delay — from the menu, `h` / `k` or a script message —
 are saved for its headphones as soon as they change, and come back whenever
 those headphones play again: the next file, the next launch, and after `y`,
@@ -246,6 +278,7 @@ they last only until mpv quits.
 | `y` | swap |
 | `h` / `k` | balance: make the left ear / first pair louder, or the other side (2 dB steps) |
 | `←` / `→` | back / forward exactly 5 s, to hear a line again (hold to keep going) |
+| Left / right mouse double-click | back / forward exactly 5 s on the video |
 
 Shift is required so a stray keypress can't switch the language mid-movie.
 `{` / `}` take over mpv's halve / double speed keys; `[` / `]` still change the
@@ -259,6 +292,13 @@ shows the new position. `seek_step` (options below) changes the 5 s, for
 the menu's Back / Forward too; `seek_keys=no` leaves mpv's own `←` / `→`
 (the menu still seeks exactly). `Shift+←` / `Shift+→` stay mpv's exact 1 s
 steps.
+
+Mouse seeks use the same `seek_step`. A single right click still pauses or
+resumes, after the double-click detection interval (normally 300 ms), so a
+double right click seeks without changing the pause state. The on-screen
+controls keep their own clicks. Left double-click replaces mpv's fullscreen
+shortcut; use `f` for fullscreen, or set `seek_mouse=no` to restore the
+original mouse bindings. Your `input.conf` bindings take precedence.
 
 Rebind in `~/.config/mpv/input.conf`, e.g. `Ctrl+d script-binding dual_audio/toggle`
 (names: `toggle`, `cycle-left`, `cycle-right`, `swap`, `balance-left`, `balance-right`,
@@ -302,10 +342,13 @@ balance_step=2
 # seconds for ←/→ and the menu's Back/Forward; seek_keys=no keeps mpv's own ←/→
 seek_step=5
 seek_keys=yes
+seek_mouse=yes
 # subtitles in both pairs' languages
 follow_subs=yes
 # where each headphones' loudness and delay are remembered (~~ = mpv's config dir)
 devices_file=~~/dual_audio-devices.json
+# per-device languages and file/playlist track choices
+tracks_file=~~/dual_audio-tracks.json
 ```
 
 ## Good to know
@@ -321,6 +364,41 @@ devices_file=~~/dual_audio-devices.json
 - Video is untouched, and so are the subtitles unless they follow the
   pairs: the graph only handles audio (while calibrating, the pattern's
   picture too). Seeking works as usual, `←` / `→` aside ([Keys](#keys)).
+
+## Playback performance
+
+`dualplay` enables `--hwdec=auto`: on supported Macs and codecs mpv uses
+Apple's VideoToolbox media engine, leaving the CPU more room for two audio
+tracks. Unsupported video falls back to software decoding. This works with
+MKV directly; remuxing or transcoding the movie is not required. Add
+`--hwdec=no` after the file name to override it, or use mpv's `Ctrl+h` to
+toggle it during playback. See [mpv's hardware decoding documentation](https://mpv.io/manual/stable/#options-hwdec).
+
+With two headphone pairs, the launcher raises mpv's output buffer from
+0.2 to 0.5 seconds to tolerate short scheduling stalls. Volume and live
+filter changes may take slightly longer to reach the headphones; video
+sync still accounts for buffered audio. Override it after the file name,
+e.g. `--audio-buffer=0.8`. Both tracks share one video decoder and demuxer;
+when both pairs select one audio track, it is decoded, downmixed and
+resampled once before splitting it.
+
+The helper selects a common nominal sample rate for both outputs and the
+aggregate device: 48 kHz if supported, otherwise 44.1 kHz or another common
+rate. It waits for that rate to settle and retains drift correction on the
+second output. [Apple's aggregate-device guidance](https://support.apple.com/guide/audio-midi-setup/set-aggregate-device-settings-ams094c7edb4/mac)
+requires matching sample rates and drift correction for independent clocks.
+The chosen rate and clock appear in the launcher log. Headphones in mono
+Bluetooth call mode are rejected with an explanation; stop the app using
+their microphone or choose the Mac's microphone before retrying.
+
+Crackle confined to the second pair, especially when pause/resume clears
+it, can also come from Bluetooth or the aggregate device's clock handling.
+Extra CPU headroom and buffering cannot guarantee a cure for that path.
+If it persists, compare the same file with one Bluetooth pair plus a wired
+output (`-2 -p ... -p ...`) and keep the playback log, e.g.
+`./dualplay -2 movie.mkv --log-file=playback.log`. The existing synthetic
+tests use silent outputs and simulated devices; they cannot verify actual
+two-Bluetooth playback on a particular Mac.
 
 ## How it works
 
