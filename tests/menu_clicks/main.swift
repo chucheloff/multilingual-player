@@ -32,6 +32,7 @@ if pairs {
                  + "dual_audio-pair_names=Pair A|Pair B,dual_audio-helper=" + args[4]),
                 ("log-file", args[5])]
 }
+options += [("script-opts-append", "dual_audio-tracks_file=\(args[3]).tracks.json")]
 for (k, v) in options {
     mpv_set_option_string(mpv, k, v)
 }
@@ -153,7 +154,7 @@ Thread {
     wait("swap") { graph().hasPrefix("[aid2]") }
     wait("menu shows the swap") { ui { trackMenus().first?.title } == "Audio track: [2] Russian 1000Hz 5.1 (rus)" }
     ui { click(trackMenus()[1].submenu!, "[2] Russian 1000Hz 5.1 (rus)") }
-    wait("same track for both from the submenu") { graph().hasPrefix("[aid2]asplit=2") }
+    wait("same track for both from the submenu") { graph().hasPrefix("[aid2]") && graph().contains("[shared]asplit=2") }
     wait("menu shows it") { ui { trackMenus().last?.title } == "Audio track: [2] Russian 1000Hz 5.1 (rus)" }
     // A slider sends each step as it happens, not after a pause.
     let sent = ui { () -> [Double] in
@@ -188,6 +189,20 @@ Thread {
     wait("forward 5 s to 8.0") { at(8) }
     ui { click(menu(), "Back 5 s") }
     wait("back 5 s to 3.0") { at(3) }
+    ui {
+        let preferences = menu().items.filter { $0.title.hasPrefix("Preferred language:") }
+        click(preferences[1].submenu!, "English (en / eng)")
+    }
+    wait("device language preference selects English") {
+        sides().last?["language"] as? String == "en" && sides().last?["track"] as? Int == 1 && at(3)
+    }
+    ui {
+        let preferences = menu().items.filter { $0.title.hasPrefix("Preferred language:") }
+        click(preferences[1].submenu!, "Russian (ru / rus)")
+    }
+    wait("device language preference selects Russian") {
+        sides().last?["language"] as? String == "ru" && sides().last?["track"] as? Int == 2 && at(3)
+    }
     ui { click(menu(), "Dual audio") }
     wait("dual audio off") { graph().isEmpty }
     ui { click(menu(), "Forward 5 s") }
