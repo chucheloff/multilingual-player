@@ -143,9 +143,56 @@ func setLayout(_ id: AudioObjectID, _ labels: [AudioChannelLabel]) {
     }
 }
 
+func sampleRate(_ id: AudioObjectID) -> Double {
+    var addr = address(kAudioDevicePropertyNominalSampleRate)
+    var rate = Float64(0)
+    var size = UInt32(MemoryLayout<Float64>.size)
+    guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &rate) == noErr else { return 0 }
+    return rate
+}
+
+func availableRates(_ id: AudioObjectID) -> [AudioValueRange] {
+    var addr = address(kAudioDevicePropertyAvailableNominalSampleRates)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &size) == noErr, size > 0 else { return [] }
+    var ranges = [AudioValueRange](repeating: AudioValueRange(), count: Int(size) / MemoryLayout<AudioValueRange>.stride)
+    guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &ranges) == noErr else { return [] }
+    return Array(ranges.prefix(Int(size) / MemoryLayout<AudioValueRange>.stride))
+}
+
+// Unsynchronised Bluetooth clocks still need drift correction, but both
+// devices must start at the same nominal rate. Prefer the movie's usual
+// 48 kHz, then 44.1 kHz, then a rate advertised by both devices.
+func commonRate(_ pair: [Device]) -> Double {
+    let ranges = pair.map { availableRates($0.id) }
+    let current = pair.map { sampleRate($0.id) }
+    let candidates = [48_000.0, 44_100.0] + current + ranges.flatMap { $0.map(\.mMinimum) }
+    guard let rate = candidates.first(where: { rate in
+        rate > 0 && pair.indices.allSatisfy { i in
+            ranges[i].contains { rate >= $0.mMinimum && rate <= $0.mMaximum }
+                || abs(current[i] - rate) < 1
+        }
+    }) else { fail("the outputs have no common sample rate; select compatible stereo outputs") }
+    return rate
+}
+
+func setSampleRate(_ id: AudioObjectID, _ rate: Double) -> Bool {
+    if abs(sampleRate(id) - rate) < 1 { return true }
+    var addr = address(kAudioDevicePropertyNominalSampleRate)
+    var value = Float64(rate)
+    return AudioObjectSetPropertyData(id, &addr, 0, nil, UInt32(MemoryLayout<Float64>.size), &value) == noErr
+}
+
 func create(_ names: [String]) {
     let pair = pick(names)
+    guard pair.allSatisfy({ $0.outputChannels == 2 }) else {
+        fail("each output must have 2 channels; a Bluetooth microphone may have put headphones in call mode")
+    }
+    let rate = commonRate(pair)
     destroy()  // left over from a run that was killed
+    for d in pair where !setSampleRate(d.id, rate) {
+        fail("could not set \(d.name) to \(Int(rate)) Hz")
+    }
     let description: [String: Any] = [
         kAudioAggregateDeviceNameKey: aggregateName,
         kAudioAggregateDeviceUIDKey: aggregateUID,
@@ -170,8 +217,20 @@ func create(_ names: [String]) {
         fail("expected 4 output channels, got \(outputChannels(id)) (devices: "
              + pair.map { "\($0.name) \($0.outputChannels) ch" }.joined(separator: ", ") + ")")
     }
+    guard setSampleRate(id, rate) else {
+        destroy()
+        fail("could not set the combined device to \(Int(rate)) Hz")
+    }
+    let rateDeadline = Date().addingTimeInterval(5)
+    while (pair.contains { abs(sampleRate($0.id) - rate) >= 1 } || abs(sampleRate(id) - rate) >= 1)
+            && Date() < rateDeadline { usleep(50_000) }
+    guard pair.allSatisfy({ abs(sampleRate($0.id) - rate) < 1 }), abs(sampleRate(id) - rate) < 1 else {
+        destroy()
+        fail("the outputs did not settle at \(Int(rate)) Hz; reconnect the headphones and retry")
+    }
     setLayout(id, [kAudioChannelLabel_Left, kAudioChannelLabel_Right,
                    kAudioChannelLabel_LeftSurround, kAudioChannelLabel_RightSurround])
+    FileHandle.standardError.write(("audio-pairs: \(Int(rate)) Hz, clock: \(pair[0].name), drift correction: \(pair[1].name)\n").data(using: .utf8)!)
     print([aggregateUID, pair[0].name, pair[1].name].joined(separator: "\t"))
 }
 

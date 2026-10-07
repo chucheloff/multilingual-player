@@ -33,6 +33,7 @@ struct Side: Sendable {
     let track: Int?
     let gain: Double     // dB
     let delay: Double    // ms
+    let language: String // preferred language for this output; empty: automatic
 }
 
 /// What dual_audio.lua publishes; `loaded` is false while it hasn't (yet).
@@ -66,7 +67,8 @@ struct State: Sendable {
         sides = (o["sides"] as? [[String: Any]] ?? []).map { s in
             Side(name: s["name"] as? String ?? "?", device: s["device"] as? String,
                  lost: s["lost"] as? Bool ?? false, track: s["track"] as? Int,
-                 gain: s["gain"] as? Double ?? 0, delay: s["delay"] as? Double ?? 0)
+                 gain: s["gain"] as? Double ?? 0, delay: s["delay"] as? Double ?? 0,
+                 language: s["language"] as? String ?? "")
         }
     }
 }
@@ -347,6 +349,7 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
             menu.addItem(row(SliderRow("Delay", -1000...1000, step: 10, unit: "ms", value: side.delay) { [mpv] v in
                 mpv.command("script-message-to", "dual_audio", "set-delay", "\(i + 1)", "\(Int(v))")
             }))
+            menu.addItem(language(for: side, i + 1))
         }
         if state.active {
             menu.addItem(.separator())
@@ -428,6 +431,22 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
         return parent
     }
 
+    private func language(for side: Side, _ n: Int) -> NSMenuItem {
+        let names = [("", "Automatic"), ("en", "English (en / eng)"), ("ru", "Russian (ru / rus)")]
+        let current = names.first { $0.0 == side.language }?.1 ?? "Automatic"
+        let parent = NSMenuItem(title: "Preferred language: " + current, action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        for (code, name) in names {
+            let it = item(name, #selector(preferLanguage(_:)))
+            it.representedObject = ["\(n)", code]
+            it.state = code == side.language ? .on : .off
+            sub.addItem(it)
+        }
+        parent.submenu = sub
+        return parent
+    }
+
     private func item(_ title: String, _ action: Selector) -> NSMenuItem {
         let it = NSMenuItem(title: title, action: action, keyEquivalent: "")
         it.target = self
@@ -467,6 +486,11 @@ final class BubbaMenu: NSObject, NSMenuDelegate {
     @objc private func move(_ sender: NSMenuItem) {
         guard let v = sender.representedObject as? [String] else { return }
         mpv.command(["script-message-to", "dual_audio", "set-device"] + v)
+    }
+
+    @objc private func preferLanguage(_ sender: NSMenuItem) {
+        guard let v = sender.representedObject as? [String] else { return }
+        mpv.command(["script-message-to", "dual_audio", "set-language"] + v)
     }
 
     @objc private func back() { mpv.command("script-binding", "dual_audio/seek-back") }

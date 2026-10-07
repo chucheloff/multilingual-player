@@ -54,8 +54,10 @@ local opts = {
     balance_step = 2,   -- dB per balance keypress
     follow_subs = false, -- subtitles in both sides' languages (see update_subs)
     devices_file = "~~/dual_audio-devices.json",  -- remembered loudness and delay; "" for none
+    tracks_file = "~~/dual_audio-tracks.json",    -- device languages and file/playlist track choices
     seek_step = 5,      -- seconds that Left / Right and the menu's Back / Forward move
     seek_keys = true,   -- Left / Right seek exactly; no: mpv's own (keyframe) seeks stay on them
+    seek_mouse = true,  -- double left / right click: seek back / forward
 }
 options.read_options(opts, "dual_audio")
 local pairs_mode = opts.mode == "pairs"
@@ -76,9 +78,8 @@ local left, right       -- track ids for the current file (may be the same)
 local gain = { 0, 0 }   -- dB per side: left ear / first pair, then the other
 local delay = { 0, 0 }  -- ms per side; negative plays that side earlier
 local ours = false      -- lavfi-complex currently holds our graph
--- Languages to look for in the next file; follows manual track changes so a
--- playlist of episodes keeps the same assignment.
-local pref = { left = opts.left_lang, right = opts.right_lang }
+-- Track selection uses per-device file and playlist memory (defined below).
+local pick, remember   -- defined after the per-device stores
 local follow = opts.follow_subs
 local sub_props = { "sid", "secondary-sid" }  -- the first side's subtitles, then the other's
 local sub_shown = { "sub-visibility", "secondary-sub-visibility" }  -- both slots; hidden while calibrating
@@ -142,26 +143,6 @@ local function first_other(tracks, except)
     end
 end
 
--- Preferred languages first; otherwise the track already playing stays in
--- the left ear and the next one goes right. Both sides get the same track
--- if they shared one in the last file, or if the right side's languages
--- match nothing else.
-local function pick(tracks)
-    left = by_lang(tracks, pref.left)
-    right = by_lang(tracks, pref.right, left) or by_lang(tracks, pref.right)
-    if not left then
-        local cur = mp.get_property_number("current-tracks/audio/id")
-        left = (cur ~= right and cur) or first_other(tracks, right)
-    end
-    right = pref.same and left or right or first_other(tracks, left)
-end
-
-local function remember(tracks)
-    pref.left = by_id(tracks, left).lang or ""
-    pref.right = by_id(tracks, right).lang or ""
-    pref.same = left == right
-end
-
 local function input(src, pad)
     return string.format("%saresample=48000,aformat=channel_layouts=%s[%s];",
         src, pairs_mode and "stereo" or "mono", pad)
@@ -170,10 +151,14 @@ end
 -- The tracks, joined: ears FL | FR, pairs FL FR | BL BR.
 local function graph()
     local l, r = "[aid" .. left .. "]", "[aid" .. right .. "]"
-    local split = ""
     -- A track feeds only one filter, so split it when both sides play it.
-    if left == right then split, l, r = l .. "asplit=2[sl][sr];", "[sl]", "[sr]" end
-    local g = split .. input(l, "l") .. input(r, "r")
+    local g
+    if left == right then
+        -- Downmix and resample once when both devices share a track.
+        g = input(l, "shared") .. "[shared]asplit=2[l][r];"
+    else
+        g = input(l, "l") .. input(r, "r")
+    end
     if pairs_mode then
         return g .. "[l][r]join=inputs=2:channel_layout=quad:map=0.0-FL|0.1-FR|1.0-BL|1.1-BR[ao]"
     end
@@ -293,15 +278,37 @@ end
 -- devices_file. With --no-config "~~/" has no directory to point to (mpv
 -- skips its watch-later files then too), so they last only while mpv runs.
 local saved = {}
-local store = opts.devices_file ~= "" and mp.command_native({ "expand-path", opts.devices_file }) or nil
-if store and opts.devices_file:find("^~~") and not store:find("^/") then store = nil end
+local function store_path(path)
+    local expanded = path ~= "" and mp.command_native({ "expand-path", path }) or nil
+    if expanded and path:find("^~~") and not expanded:find("^/") then return nil end
+    return expanded
+end
+local store = store_path(opts.devices_file)
 
-local function load()
-    local f = store and io.open(store)
-    if not f then return end
+local function read_store(path, fallback)
+    local f = path and io.open(path)
+    if not f then return fallback end
     local t = utils.parse_json(f:read("*a"))
     f:close()
-    if type(t) == "table" then saved = t end
+    return type(t) == "table" and t or fallback
+end
+
+local function write_store(path, values)
+    if not path then return end
+    local tmp = path .. ".tmp"
+    local f = io.open(tmp, "w")
+    if not f then
+        mp.command_native({ name = "subprocess", playback_only = false,
+                            args = { "mkdir", "-p", (utils.split_path(path)) } })
+        f = io.open(tmp, "w")
+    end
+    local ok = f and f:write(next(values) and utils.format_json(values) or "{}")
+    if f then ok = f:close() and ok end
+    if not (ok and os.rename(tmp, path)) then msg.warn("could not save " .. path) end
+end
+
+local function load()
+    saved = read_store(store, saved)
 end
 
 -- Takes the settings of the sides' devices; true if that changed anything.
@@ -325,17 +332,131 @@ local function save()
     for i = 1, 2 do
         saved[device_key(i)] = (gain[i] ~= 0 or delay[i] ~= 0) and { gain = gain[i], delay = delay[i] } or nil
     end
-    if not store then return end
-    local tmp = store .. ".tmp"
-    local f = io.open(tmp, "w")
-    if not f then  -- the first save, before mpv's config dir exists
-        mp.command_native({ name = "subprocess", playback_only = false,
-                            args = { "mkdir", "-p", (utils.split_path(store)) } })
-        f = io.open(tmp, "w")
+    write_store(store, saved)
+end
+
+-- Track IDs belong to a file, not a language or dub. Keep a descriptor so
+-- the same dub can be found even when the next episode reorders its tracks.
+local track_store = store_path(opts.tracks_file)
+local choices = read_store(track_store, {})
+local file_key, playlist_key
+
+local function path_key(path)
+    if not path or path == "" then return nil end
+    if path:match("^%a[%w+.-]*://") then return path end
+    return mp.command_native({ "normalize-path", path }) or path
+end
+
+local function context_keys()
+    file_key = path_key(mp.get_property("path"))
+    local paths, folder, same = {}, nil, true
+    for _, entry in ipairs(mp.get_property_native("playlist", {})) do
+        local path = path_key(entry.filename)
+        if path then
+            paths[#paths + 1] = path
+            local dir = utils.split_path(path)
+            if folder and folder ~= dir then same = false end
+            folder = folder or dir
+        end
     end
-    local ok = f and f:write(next(saved) and utils.format_json(saved) or "{}")
-    if f then f:close() end
-    if not (ok and os.rename(tmp, store)) then msg.warn("could not save " .. store) end
+    -- A season keeps its identity when launched at a later episode, or
+    -- when new episodes are added. Lists spanning folders keep their order.
+    playlist_key = same and folder and ("folder:" .. folder)
+        or (#paths > 0 and "playlist:" .. utils.format_json(paths) or nil)
+end
+
+local function device_choices(i)
+    local key = device_key(i)
+    -- mpv tags parsed JSON arrays. An empty Lua map is serialized as [],
+    -- and adding string keys to that parsed array would silently discard
+    -- them on the next save. Copy our maps into fresh object tables.
+    local function object(value)
+        if type(value) == "table" and getmetatable(value) == nil then return value end
+        local result = {}
+        if type(value) == "table" then
+            for k, v in pairs(value) do
+                if type(k) == "string" then result[k] = v end
+            end
+        end
+        return result
+    end
+    local s = object(choices[key])
+    s.files, s.playlists = object(s.files), object(s.playlists)
+    if s.language ~= "en" and s.language ~= "ru" then s.language = nil end
+    choices[key] = s
+    return s
+end
+
+local function title_key(title)
+    return (title or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function descriptor(tracks, id)
+    local t = by_id(tracks, id)
+    if not t then return nil end
+    local lang, ordinal = base_lang(t.lang or ""), 0
+    for _, other in ipairs(tracks) do
+        if base_lang(other.lang or "") == lang then ordinal = ordinal + 1 end
+        if other.id == id then break end
+    end
+    return { id = id, lang = lang, title = title_key(t.title), codec = t.codec, ordinal = ordinal }
+end
+
+local function match_choice(tracks, choice, exact)
+    if type(choice) ~= "table" then return nil end
+    local candidates = {}
+    for _, t in ipairs(tracks) do
+        if base_lang(t.lang or "") == choice.lang then
+            candidates[#candidates + 1] = t
+            if exact and t.id == choice.id and title_key(t.title) == choice.title
+                and t.codec == choice.codec then return t.id end
+        end
+    end
+    -- A named dub is more useful than an ID or a codec across episodes.
+    if choice.title ~= "" then
+        for _, t in ipairs(candidates) do
+            if title_key(t.title) == choice.title then return t.id end
+        end
+    end
+    local t = candidates[tonumber(choice.ordinal) or 1]
+    if t then return t.id end
+    return candidates[1] and candidates[1].id
+end
+
+local function preferred_track(tracks, i, except)
+    local s = device_choices(i)
+    local file = type(s.files) == "table" and s.files[file_key]
+    local id = match_choice(tracks, file, true)
+    if id then return id end
+    local playlist = type(s.playlists) == "table" and s.playlists[playlist_key]
+    if type(playlist) == "table" and (not s.language or s.language == playlist.lang) then
+        id = match_choice(tracks, playlist, false)
+        if id then return id end
+    end
+    local langs = s.language or (i == 1 and opts.left_lang or opts.right_lang)
+    return by_lang(tracks, langs, except) or by_lang(tracks, langs)
+end
+
+pick = function(tracks)
+    left = preferred_track(tracks, 1)
+    right = preferred_track(tracks, 2, left)
+    if not left then
+        local cur = mp.get_property_number("current-tracks/audio/id")
+        left = (by_id(tracks, cur) and cur ~= right and cur) or first_other(tracks, right) or right
+    end
+    right = right or first_other(tracks, left) or left
+end
+
+remember = function(tracks)
+    choices = read_store(track_store, choices)
+    for i, id in ipairs({ left, right }) do
+        local s, choice = device_choices(i), descriptor(tracks, id)
+        if choice then
+            if file_key then s.files[file_key] = choice end
+            if playlist_key then s.playlists[playlist_key] = choice end
+        end
+    end
+    write_store(track_store, choices)
 end
 
 -- The state as the bubbaTV menu shows it. `device` is left out when mpv
@@ -349,7 +470,8 @@ local function publish()
     local sides = {}
     for i, id in ipairs({ left or false, right or false }) do
         sides[i] = { name = side_names[i], device = devices[i] or output(),
-                     lost = lost[i], track = id or nil, gain = gain[i], delay = delay[i] }
+                     lost = lost[i], track = id or nil, gain = gain[i], delay = delay[i],
+                     language = device_choices(i).language or "" }
     end
     mp.set_property_native("user-data/dual_audio", {
         enabled = enabled, active = ours, mode = opts.mode, tracks = list, sides = sides,
@@ -610,6 +732,30 @@ local function seek(dir)
     mp.commandv("osd-msg-bar", "seek", dir * opts.seek_step, "relative+exact")
 end
 
+-- A device's default language applies to new files. An explicit file pick
+-- can still override it. Changing the default clears this context's picks
+-- and selects the matching language immediately when one is available.
+mp.register_script_message("set-language", function(side, language)
+    local i = tonumber(side)
+    if not (i == 1 or i == 2) or not language then return end
+    local lang = base_lang(language)
+    if lang ~= "" and lang ~= "en" and lang ~= "ru" then return end
+    choices = read_store(track_store, choices)
+    local s = device_choices(i)
+    s.language = lang ~= "" and lang or nil
+    if type(s.files) == "table" and file_key then s.files[file_key] = nil end
+    if type(s.playlists) == "table" and playlist_key then s.playlists[playlist_key] = nil end
+    write_store(track_store, choices)
+    if ours then
+        local id = preferred_track(audio_tracks(), i)
+        if id then
+            if i == 1 then left = id else right = id end
+            apply(true)
+        end
+    end
+    publish()
+end)
+
 -- set-track / set-gain / set-delay SIDE VALUE, from the bubbaTV menu.
 local setters = {
     ["set-track"] = function(i, id)
@@ -651,6 +797,13 @@ local function run_queue()
                 -- reopened output gets our filter built anew from its
                 -- string, so that has them, and any live changes, first.
                 restore()
+                local previous_left, previous_right = left, right
+                if ours then
+                    local tracks = audio_tracks()
+                    left = preferred_track(tracks, 1) or left
+                    right = preferred_track(tracks, 2) or right
+                end
+                if left ~= previous_left or right ~= previous_right then apply(true) end
                 if ours then set_af(true) end
                 mp.commandv("ao-reload")
                 publish()
@@ -719,6 +872,8 @@ mp.register_event("start-file", function() loading = true end)
 -- Before mpv selects the tracks: it takes the subtitles set here too.
 mp.add_hook("on_preloaded", 50, function()
     left, right = nil, nil
+    choices = read_store(track_store, choices)
+    context_keys()
     restore()
     apply(false)
     loading = false
@@ -732,7 +887,16 @@ end)
 -- output - which in ears mode brings its own saved settings.
 mp.observe_property("track-list", nil, publish)
 mp.observe_property("audio-device", nil, function()
-    if restore() then tune() else publish() end
+    local changed = restore()
+    choices = read_store(track_store, choices)
+    local previous_left, previous_right = left, right
+    if ours and not loading then
+        local tracks = audio_tracks()
+        left = preferred_track(tracks, 1) or left
+        right = preferred_track(tracks, 2) or right
+    end
+    if left ~= previous_left or right ~= previous_right then apply(true)
+    elseif changed then tune() else publish() end
 end)
 for _, prop in ipairs(sub_props) do mp.observe_property(prop, "number", subs_changed) end
 
@@ -773,3 +937,26 @@ mp.add_key_binding(nil, "calibrate", calibrate)
 -- these, as for the other keys.
 mp.add_key_binding(opts.seek_keys and "LEFT" or nil, "seek-back", function() seek(-1) end, { repeatable = true })
 mp.add_key_binding(opts.seek_keys and "RIGHT" or nil, "seek-forward", function() seek(1) end, { repeatable = true })
+-- The first right click must wait for a possible double click, otherwise
+-- mpv's normal pause binding would pause/resume the movie during the seek.
+-- Single right click still pauses; OSC controls retain their own bindings.
+if opts.seek_mouse then
+    local pause_timer, ignore_right_until = nil, 0
+    local function double_time()
+        return math.max(mp.get_property_number("input-doubleclick-time", 300) / 1000, 0.05)
+    end
+    mp.add_key_binding("MBTN_RIGHT", "mouse-pause", function()
+        if mp.get_time() < ignore_right_until then return end
+        if pause_timer then pause_timer:kill() end
+        pause_timer = mp.add_timeout(double_time(), function()
+            pause_timer = nil
+            mp.commandv("cycle", "pause")
+        end)
+    end)
+    mp.add_key_binding("MBTN_LEFT_DBL", "mouse-seek-back", function() seek(-1) end)
+    mp.add_key_binding("MBTN_RIGHT_DBL", "mouse-seek-forward", function()
+        if pause_timer then pause_timer:kill(); pause_timer = nil end
+        ignore_right_until = mp.get_time() + double_time()
+        seek(1)
+    end)
+end

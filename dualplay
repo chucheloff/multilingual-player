@@ -75,7 +75,9 @@ set -- "${files[@]}" "$@"
 command -v mpv >/dev/null || { echo "dualplay: mpv not found - brew install mpv" >&2; exit 1; }
 
 scripts="${MPV_HOME:-$HOME/.config/mpv}/scripts"
-args=()
+# Let the video decoder use the Mac's media engine instead of competing with
+# both audio decoders for CPU time. Options supplied after the files win.
+args=(--hwdec=auto)
 # Skip --script if the plugin is already installed, or mpv would load it twice.
 [ -e "$scripts/dual_audio.lua" ] || args+=(--script="$here/scripts/dual_audio.lua")
 
@@ -117,6 +119,7 @@ IFS=$'\t' read -r uid first second <<<"$info"
 echo "dualplay: first track -> $first, second track -> $second"
 
 args+=(--audio-device="coreaudio/$uid" --audio-channels=quad
+       --audio-buffer=0.5
        --script-opts-append=dual_audio-mode=pairs
        --script-opts-append="dual_audio-pair_names=$first|$second"
        --script-opts-append="dual_audio-helper=$helper")

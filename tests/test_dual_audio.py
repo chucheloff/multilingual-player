@@ -82,6 +82,10 @@ def devices_file(tmpdir):
     return "--script-opts-append=dual_audio-devices_file=" + os.path.join(tmpdir, "devices.json")
 
 
+def tracks_file(tmpdir):
+    return "--script-opts-append=dual_audio-tracks_file=" + os.path.join(tmpdir, "tracks.json")
+
+
 class Render(unittest.TestCase):
     """Render 3s of playback to a WAV and inspect the channels."""
 
@@ -208,13 +212,15 @@ class Mpv:
         self.path = os.path.join(tmpdir, "mpv.sock")
         if os.path.exists(self.path):  # left by an mpv before
             os.unlink(self.path)
-        own = [] if store is False else [devices_file(store or tmpdir)]
+        own = [] if store is False else [devices_file(store or tmpdir), tracks_file(store or tmpdir)]
         self.proc = subprocess.Popen(cmd + ["--ao=null", "--input-ipc-server=" + self.path,
                                             *opts, *own, *([src] if src else [])],
                                      env=env, stdout=subprocess.DEVNULL)
         deadline = time.time() + 10
         while not os.path.exists(self.path):
-            if time.time() > deadline:
+            if self.proc.poll() is not None or time.time() > deadline:
+                self.proc.terminate()
+                self.proc.wait(timeout=10)
                 raise RuntimeError("mpv did not open its IPC socket")
             time.sleep(0.05)
         self.sock = socket.socket(socket.AF_UNIX)
@@ -357,7 +363,7 @@ class Keys(Playing):
         self.press("a", (1, 2))     # on: current track left, next right
         self.press("}", (1, 3))     # right ear -> next track
         self.press("}", (1, 1))     # wraps around to the left ear's track: both hear it
-        self.assertIn("[aid1]asplit=2", self.mpv.get("lavfi-complex"))
+        self.assertIn("[shared]asplit=2[l][r]", self.mpv.get("lavfi-complex"))
         self.press("{", (2, 1))     # left ear -> next track
         self.assertEqual(self.mpv.get("speed"), 1)  # { } no longer change the speed
         self.mpv.command("keypress", "]")  # plain ] is mpv's speed key again
@@ -511,7 +517,7 @@ class Keys(Playing):
         self.assertEqual(self.saved(), {"Nikita’s AirPods": {"gain": -4, "delay": 0},
                                         "Friend, Pro": {"gain": 0, "delay": -150}})
         self.restart(pairs, "--script-opts-append=dual_audio-pair_names=Friend, Pro|Nikita’s AirPods")
-        self.press("a", (1, 2))
+        self.press("a", (1, 2))  # saved tracks follow the device as well as gain and delay
         self.af_has("volume@dual_audio1=0dB", "volume@dual_audio2=-4dB",
                     "delays=0|0|150|150,asetpts@dual_audio=PTS-0.15/TB")
         self.assertEqual([(s["device"], s["gain"], s["delay"]) for s in self.state()["sides"]],
@@ -671,6 +677,39 @@ class Keys(Playing):
         self.lands(13)
         self.assertEqual(self.state()["seek_step"], 10)  # for the menu
 
+    def test_mouse_double_click_seeks(self):
+        for dual in (False, True):
+            if dual:
+                self.press("a", (1, 2))
+            graph = self.mpv.get("lavfi-complex")
+            self.seek_key("MBTN_RIGHT_DBL", 8)
+            self.seek_key("MBTN_LEFT_DBL", 3)
+            self.assertEqual(self.mpv.get("lavfi-complex"), graph)
+            self.assertFalse(self.mpv.get("fullscreen"))
+            self.assertTrue(self.mpv.get("pause"))
+
+    def test_mouse_seeks_can_be_disabled(self):
+        self.restart("--script-opts-append=dual_audio-seek_mouse=no")
+        self.mpv.command("keypress", "MBTN_LEFT_DBL")
+        self.mpv.wait_for(lambda: self.mpv.get("fullscreen"))
+        self.lands(3)
+
+    def test_right_mouse_click_sequence_keeps_pause_state(self):
+        # mpv generates a double-click event from two real down/up pairs.
+        self.mpv.command("keydown", "MBTN_RIGHT")
+        self.mpv.command("keyup", "MBTN_RIGHT")
+        time.sleep(0.08)
+        self.mpv.command("keydown", "MBTN_RIGHT")
+        self.mpv.command("keyup", "MBTN_RIGHT")
+        self.lands(8)
+        time.sleep(0.4)
+        self.assertTrue(self.mpv.get("pause"))
+        self.lands(8)
+        # A later single right click still toggles playback.
+        self.mpv.command("keydown", "MBTN_RIGHT")
+        self.mpv.command("keyup", "MBTN_RIGHT")
+        self.mpv.wait_for(lambda: not self.mpv.get("pause"))
+
     def test_mpv_arrow_keys(self):
         # seek_keys=no leaves mpv's own arrow seeks on Left / Right (to the
         # next keyframe); the menu's Back / Forward still seek exactly.
@@ -685,6 +724,135 @@ class Keys(Playing):
         self.restart("--input-conf=" + conf)
         self.seek_key("RIGHT", 10)
         self.seek_key("LEFT", 5)  # still the script's
+
+
+class TrackMemory(Playing):
+    """Two Russian dubs whose IDs change between episodes, with device
+    choices persisted between launches. No real audio devices are used."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        season = os.path.join(self.tmp.name, "Season")
+        os.mkdir(season)
+        self.first = os.path.join(season, "Episode 1.mkv")
+        self.second = os.path.join(season, "Episode 2.mkv")
+        for path, order in ((self.first, (0, 1, 2)), (self.second, (2, 0, 1))):
+            args = ["ffmpeg", "-v", "error", "-i", TONES, "-map", "0:v"]
+            for index in order:
+                args += ["-map", "0:a:" + str(index)]
+            args += ["-c", "copy"]
+            for index, source in enumerate(order):
+                args += [f"-metadata:s:a:{index}", "language=" + ("en" if source == 0 else "rus"),
+                         f"-metadata:s:a:{index}", "title=" + ("Original" if source == 0 else f"Dub {source}")]
+            subprocess.run(args + [path], check=True)
+        self.runs = 0
+        self.start(self.first, self.second)
+
+    def start(self, *files, names="Pair A|Pair B", extra=()):
+        self.runs += 1
+        run = os.path.join(self.tmp.name, str(self.runs))
+        os.mkdir(run)
+        self.mpv = Mpv(run, "--start=3", "--pause", "--audio-channels=quad",
+                       "--script-opts-append=dual_audio-auto=yes",
+                       "--script-opts-append=dual_audio-mode=pairs",
+                       "--script-opts-append=dual_audio-pair_names=" + names,
+                       *extra, *files, src=None, store=self.tmp.name)
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") is not None)
+
+    def tearDown(self):
+        self.mpv.close()
+        self.tmp.cleanup()
+
+    def test_dub_survives_reordered_tracks_and_restart(self):
+        self.message("set-track", 2, 3)  # Russian Dub 2, not the first Russian track
+        self.expect((1, 3))
+        self.next_file()
+        self.expect((2, 1))  # Dub 2 now has ID 1
+        self.mpv.close()
+        self.start(self.second)
+        self.expect((2, 1))  # same season, even when only one episode is opened
+        self.mpv.close()
+        self.start(self.first, self.second, names="Pair B|Pair A")
+        self.expect((3, 1))  # headphone order reversed
+
+    def test_file_choice_overrides_later_playlist_choice(self):
+        self.message("set-track", 2, 3)
+        self.expect((1, 3))
+        self.next_file()
+        self.message("set-track", 2, 3)  # Dub 1 for Episode 2 only
+        self.expect((2, 3))
+        self.mpv.command("playlist-prev")
+        self.mpv.wait_for(lambda: self.mpv.get("playlist-pos") == 0)
+        self.expect((1, 3))  # Episode 1's own Dub 2 choice wins
+        self.mpv.close()
+        self.start(self.first, self.second)
+        self.expect((1, 3))
+        self.next_file()
+        self.expect((2, 3))
+
+    def test_preferred_language_persists_for_new_movies(self):
+        self.message("set-language", 1, "ru")
+        self.message("set-language", 2, "eng")
+        self.expect((2, 1))
+        self.mpv.wait_for(lambda: [s["language"] for s in self.state()["sides"]] == ["ru", "en"])
+        self.mpv.close()
+        self.start(TONES, names="Pair B|Pair A")
+        self.expect((1, 2))
+        with open(os.path.join(self.tmp.name, "tracks.json")) as f:
+            saved = json.load(f)
+        self.assertEqual(saved["Pair A"]["language"], "ru")
+        self.assertEqual(saved["Pair B"]["language"], "en")
+
+    def test_preference_change_clears_current_context_pick(self):
+        self.message("set-track", 2, 3)
+        self.expect((1, 3))
+        self.message("set-language", 2, "en")
+        self.expect((1, 1))
+        self.next_file()
+        self.expect((2, 2))
+        self.message("set-track", 2, 1)  # a deliberate file override is still possible
+        self.expect((2, 1))
+        self.mpv.close()
+        self.start(self.second)
+        self.expect((2, 1))
+
+    def test_missing_language_does_not_replace_preference(self):
+        self.message("set-language", 1, "rus")
+        self.message("set-language", 2, "en")
+        self.expect((2, 1))
+        missing = os.path.join(self.tmp.name, "no-russian.mkv")
+        subprocess.run(["ffmpeg", "-v", "error", "-i", TONES, "-map", "0:v", "-map", "0:a:0",
+                        "-map", "0:a:2", "-c", "copy", missing], check=True)
+        self.mpv.close()
+        self.start(missing)
+        self.expect((2, 1))  # English goes to its device; the other gets available German
+        self.assertEqual(self.state()["sides"][0]["language"], "ru")
+        self.mpv.close()
+        self.start(self.first)
+        self.expect((2, 1))  # Russian returns without another manual pick
+
+    def test_untagged_tracks_keep_their_identity(self):
+        self.mpv.close()
+        path = os.path.join(self.tmp.name, "untagged.mkv")
+        subprocess.run(["ffmpeg", "-v", "error", "-i", TONES, "-map", "0", "-c", "copy",
+                        "-metadata:s:a:0", "language=und", "-metadata:s:a:1", "language=und",
+                        "-metadata:s:a:2", "language=und", path], check=True)
+        self.start(path, path)
+        self.message("set-track", 2, 3)
+        self.expect((1, 3))
+        self.next_file()
+        self.expect((1, 3))
+
+    def test_track_memory_can_be_disabled(self):
+        self.mpv.close()
+        run = os.path.join(self.tmp.name, "disabled")
+        os.mkdir(run)
+        self.mpv = Mpv(run, "--start=3", "--pause", "--script-opts-append=dual_audio-auto=yes",
+                       "--script-opts-append=dual_audio-tracks_file=", self.first, src=None, store=False)
+        self.mpv.wait_for(lambda: self.state() and self.state()["active"])
+        self.message("set-track", 2, 3)
+        self.expect((1, 3))
+        self.assertFalse(os.path.exists(os.path.join(run, "tracks.json")))
 
 
 class Live(unittest.TestCase):
@@ -1036,6 +1204,14 @@ class Devices(unittest.TestCase):
         self.assertEqual(self.calls(), ["create|Other Phones|Friend, Pro",
                                         "create|Other Phones|Nikita’s AirPods"])
         self.mpv.wait_for(lambda: self.devices() == ["Other Phones", "Nikita’s AirPods"])
+
+    def test_track_choices_follow_a_device_move(self):
+        self.message("set-track", 2, 3)
+        self.mpv.wait_for(lambda: [s["track"] for s in self.sides()] == [1, 3])
+        self.message("set-device", 1, "Friend, Pro")
+        self.mpv.wait_for(lambda: self.devices() == ["Friend, Pro", "Nikita’s AirPods"])
+        self.mpv.wait_for(lambda: [s["track"] for s in self.sides()] == [3, 1])
+        self.assertAlmostEqual(self.mpv.get("time-pos"), 3.0, delta=0.05)
 
     def test_helper_fails(self):
         self.message("set-device", 2, "Broken Phones")
@@ -1495,12 +1671,27 @@ class Dualplay(unittest.TestCase):
         self.addCleanup(mpv.quit)
         mpv.wait_for(lambda: [s.get("device") for s in (mpv.get("user-data/dual_audio") or {})
                               .get("sides", [])] == ["Pair A", "Pair B"])
+        self.assertIn(mpv.get("hwdec"), ("auto", ["auto"]))
+        self.assertEqual(mpv.get("options/audio-buffer"), 0.5)
         # dualplay gives the script the helper, to move a pair to other headphones.
         mpv.command("script-message-to", "dual_audio", "set-device", "2", "Other Phones")
         mpv.wait_for(lambda: calls() == ["create", "create|Pair A|Other Phones"])
         mpv.quit()
         self.assertEqual(calls(), ["create", "create|Pair A|Other Phones", "destroy"])
         self.assertEqual(mpv.proc.returncode, 0)
+
+    def test_performance_defaults_can_be_overridden(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        _, env = dualplay_copy(tmp.name)
+        mpv = Mpv(tmp.name, "--pause", src=None,
+                  cmd=[os.path.join(tmp.name, "dualplay"), "-2", TONES, "--no-config", "--vo=null",
+                       "--hwdec=no", "--audio-buffer=0.8", "--really-quiet"], env=env)
+        self.addCleanup(mpv.sock.close)
+        self.addCleanup(mpv.quit)
+        mpv.wait_for(lambda: mpv.get("time-pos") is not None)
+        self.assertIn(mpv.get("hwdec"), ("no", ["no"]))
+        self.assertEqual(mpv.get("options/audio-buffer"), 0.8)
 
 
 class Folders(unittest.TestCase):
