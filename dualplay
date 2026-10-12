@@ -2,28 +2,30 @@
 # dualplay - play a video with two audio tracks at once.
 #
 # Usage: dualplay [-2] [-p NAME -p NAME] [-l LANGS] [-r LANGS] FILE|FOLDER... [mpv options...]
-#        dualplay -L
+#        dualplay -L | -B
 #   -l LANGS  languages for the left ear (with -2: first pair), e.g. "eng,en"
 #   -r LANGS  languages for the right ear (with -2: second pair), e.g. "rus,ru"
 #   -2        two headphone pairs: a stereo track on each, using the two
 #             connected Bluetooth outputs
 #   -p NAME   with -2, use this output (part of its name) instead; give it twice
 #   -L        list the connected outputs (names for -p) and exit
+#   -B        build the helper and the bubbaTV menu if they are out of date, and exit
 # Without -l/-r the track that would normally play comes first, the next one second.
 # A folder plays its videos (.mkv .mp4 .m4v .mov .avi .webm) in episode order,
 # not those in its subfolders.
 set -euo pipefail
 
-usage() { sed -n '4,14s/^# \{0,1\}//p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '4,15s/^# \{0,1\}//p' "$0"; exit "${1:-0}"; }
 
-left="" right="" pairs="" list="" names=()
-while getopts "l:r:2p:Lh" opt; do
+left="" right="" pairs="" list="" build="" names=()
+while getopts "l:r:2p:LBh" opt; do
   case $opt in
     l) left=$OPTARG ;;
     r) right=$OPTARG ;;
     2) pairs=1 ;;
     p) names+=("$OPTARG") ;;
     L) list=1 ;;
+    B) build=1 ;;
     h) usage ;;
     *) usage 1 ;;
   esac
@@ -40,7 +42,29 @@ build_helper() {
     swiftc -O -o "$helper" "$here/tools/audio-pairs.swift"
   fi
 }
+# The bubbaTV menu is a native mpv plugin, compiled on first use against the
+# headers of this mpv. Without swiftc or the headers mpv plays without it.
+menu="$here/tools/.build/bubbatv.so"
+build_menu() {
+  local header
+  header="$(dirname "$(dirname "$(readlink -f "$(command -v mpv)")")")/include/mpv/client.h"
+  if ! command -v swiftc >/dev/null || [ ! -e "$header" ]; then
+    echo "dualplay: no swiftc or mpv headers, so no bubbaTV menu" >&2
+    return 1
+  fi
+  mkdir -p "$here/tools/.build"
+  swiftc -O -emit-library -o "$menu" "$here/tools/bubbatv-menu.swift" -import-objc-header "$header" \
+    -Xlinker -undefined -Xlinker dynamic_lookup
+}
+menu_ready() { [ -e "$menu" ] && [ ! "$here/tools/bubbatv-menu.swift" -nt "$menu" ]; }
 if [ -n "$list" ]; then build_helper; exec "$helper" list; fi
+scripts="${MPV_HOME:-$HOME/.config/mpv}/scripts"
+if [ -n "$build" ]; then
+  build_helper
+  # The menu is built against the installed mpv's headers.
+  [ -e "$scripts/bubbatv.so" ] || ! command -v mpv >/dev/null || menu_ready || build_menu
+  exit 0
+fi
 
 [ ${#names[@]} -eq 0 ] || [ ${#names[@]} -eq 2 ] || { echo "dualplay: give -p twice" >&2; exit 1; }
 
@@ -76,29 +100,15 @@ set -- "${files[@]}" "$@"
 
 command -v mpv >/dev/null || { echo "dualplay: mpv not found - brew install mpv" >&2; exit 1; }
 
-scripts="${MPV_HOME:-$HOME/.config/mpv}/scripts"
 # Let the video decoder use the Mac's media engine instead of competing with
-# both audio decoders for CPU time. Options supplied after the files win.
-args=(--hwdec=auto)
+# both audio decoders for CPU time. Quitting keeps the position, for the next
+# start (and bubbaTV's Continue). Options supplied after the files win.
+args=(--hwdec=auto --save-position-on-quit=yes)
 # Skip --script if the plugin is already installed, or mpv would load it twice.
 [ -e "$scripts/dual_audio.lua" ] || args+=(--script="$here/scripts/dual_audio.lua")
 
-# The bubbaTV menu is a native mpv plugin, compiled on first use against the
-# headers of this mpv. Without swiftc or the headers mpv plays without it.
-menu="$here/tools/.build/bubbatv.so"
-build_menu() {
-  local header
-  header="$(dirname "$(dirname "$(readlink -f "$(command -v mpv)")")")/include/mpv/client.h"
-  if ! command -v swiftc >/dev/null || [ ! -e "$header" ]; then
-    echo "dualplay: no swiftc or mpv headers, so no bubbaTV menu" >&2
-    return 1
-  fi
-  mkdir -p "$here/tools/.build"
-  swiftc -O -emit-library -o "$menu" "$here/tools/bubbatv-menu.swift" -import-objc-header "$header" \
-    -Xlinker -undefined -Xlinker dynamic_lookup
-}
 if [ ! -e "$scripts/bubbatv.so" ]; then
-  if { [ -e "$menu" ] && [ ! "$here/tools/bubbatv-menu.swift" -nt "$menu" ]; } || build_menu; then
+  if menu_ready || build_menu; then
     args+=(--script="$menu")
   fi
 fi
@@ -120,8 +130,10 @@ trap 'exit 130' INT TERM  # make sure Ctrl+C still runs the EXIT trap
 IFS=$'\t' read -r uid first second <<<"$info"
 echo "dualplay: first track -> $first, second track -> $second"
 
+# Silence while paused keeps the Bluetooth link busy: idle headphones may drop
+# the Mac's stream, or switch over to a phone.
 args+=(--audio-device="coreaudio/$uid" --audio-channels=quad
-       --audio-buffer=0.5
+       --audio-buffer=0.5 --audio-stream-silence=yes
        --script-opts-append=dual_audio-mode=pairs
        --script-opts-append="dual_audio-pair_names=$first|$second"
        --script-opts-append="dual_audio-helper=$helper")
