@@ -145,6 +145,12 @@ fails, the screen says why: pick the headphones in **Device** again to retry.
 - `dropout_grace`, `auto_resume` and `resume_countdown` ([options](#install-as-a-plugin))
   change the 2 seconds, playing on by itself, and the countdown.
 
+**Continue with one pair:** turn **Dual audio** off and select that pair in
+macOS Sound settings. Playback switches to the system output in stereo,
+keeping the first pair's track; disconnecting the other pair no longer
+pauses the movie. Connect both pairs and turn **Dual audio** back on to
+rebuild their combined output and restore both tracks without restarting.
+
 Volume: `9` / `0` changes both, `h` / `k` makes one pair quieter than the other,
 and the bubbaTV menu sets each pair's loudness on its own.
 If speech lags the picture, `Ctrl+-` plays the audio 100 ms earlier (`Ctrl++` later);
