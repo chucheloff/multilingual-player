@@ -17,7 +17,8 @@ episodes plays one after another. The
 
 ## Install with Homebrew
 
-Requires macOS 14 or later and Swift 6 (Xcode 16 Command Line Tools or newer).
+Requires Homebrew 7 or newer, macOS 14 or later, and Swift 6
+(Xcode 16 Command Line Tools or newer).
 The repository is private, so Git must already have access to it. Homebrew
 uses the same Git credentials when fetching the tap and source.
 
