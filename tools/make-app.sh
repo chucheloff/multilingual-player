@@ -21,7 +21,7 @@ if [ -e "$app" ] && [ "$(bundle_id "$app/Contents/Info.plist")" != "$(bundle_id 
 fi
 
 rm -rf "$app"
-mkdir -p "$app/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 # Info.plist first, so a build that fails halfway is still ours to replace.
 plist="$app/Contents/Info.plist"
 cp "$repo/tools/bubbatv-app.plist" "$plist"
@@ -29,7 +29,12 @@ plutil -replace BubbaTVDualplay -string "$repo/dualplay" "$plist"
 # Apps started from the Dock get a bare PATH: keep this shell's, which finds
 # mpv, and Homebrew's in case mpv comes later.
 plutil -replace BubbaTVPath -string "$PATH:/opt/homebrew/bin:/usr/local/bin" "$plist"
-swiftc -O -o "$app/Contents/MacOS/bubbaTV" "$repo/tools/bubbatv-app.swift"
+swiftc -O -parse-as-library -o "$app/Contents/MacOS/bubbaTV" \
+  "$repo/tools/bubbatv-app.swift" "$repo/tools/bubbatv-home.swift" "$repo/tools/bubbatv-library.swift"
+icon_tmp=$(mktemp -d)
+trap 'rm -rf "$icon_tmp"' EXIT
+swift "$repo/tools/make-icon.swift" "$icon_tmp/bubbaTV.iconset"
+iconutil --convert icns --output "$app/Contents/Resources/bubbaTV.icns" "$icon_tmp/bubbaTV.iconset"
 codesign --force --sign - "$app"
 # In an Applications folder, tell Launch Services right away, so Finder offers
 # bubbaTV under Open With before it has ever been opened. Builds elsewhere

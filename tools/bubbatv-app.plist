@@ -9,6 +9,8 @@
 	<string>bubbaTV</string>
 	<key>CFBundleExecutable</key>
 	<string>bubbaTV</string>
+	<key>CFBundleIconFile</key>
+	<string>bubbaTV.icns</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleInfoDictionaryVersion</key>
@@ -36,6 +38,7 @@
 			<array>
 				<!-- mp4, m4v, mov, avi, mpg, ts, m2ts... -->
 				<string>public.movie</string>
+				<string>public.audio</string>
 				<string>org.matroska.mkv</string>
 				<string>org.webmproject.webm</string>
 			</array>
