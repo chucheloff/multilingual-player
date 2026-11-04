@@ -562,7 +562,7 @@ local hint = mp.create_osd_overlay("ass-events")  -- on screen while calibrating
 -- can land on the next keyframe (up to ~10s ahead). A seek of our own issued
 -- while that re-read is going on loses its keyframe the same way, so drop
 -- the re-read first, then seek to the exact position.
-local function apply(live)
+local function apply(live, reopen)
     local tracks = audio_tracks()
     local want = enabled and #tracks >= min_tracks
     -- A new graph ends calibrating: the movie comes back as it was then.
@@ -578,6 +578,9 @@ local function apply(live)
     -- Our --af filter goes in after the graph and out before it, so it only
     -- ever gets the joined channels.
     if not want then set_af(false) end
+    -- A failed audio output drops mpv's audio chain. ao-reload alone cannot
+    -- restore it: detach and reattach the graph, keeping the position above.
+    if reopen then mp.set_property("lavfi-complex", "") end
     mp.set_property("lavfi-complex", want and graph() or "")
     if want then set_af(true) end
     ours = want
@@ -819,6 +822,10 @@ local function run_queue()
                 local first, second = r.stdout:match("^[^\t]*\t([^\t]*)\t([^\t\n]*)")
                 devices = { first or names[1], second or names[2] }
                 lost = {}
+                -- Outputs may have changed while the helper was running.
+                for i = 1, 2 do
+                    if connected and not connected[devices[i]] then lost[i] = true end
+                end
                 -- Other headphones bring their own loudness and delay. The
                 -- reopened output gets our filter built anew from its
                 -- string, so that has them, and any live changes, first.
@@ -829,9 +836,10 @@ local function run_queue()
                     left = preferred_track(tracks, 1) or left
                     right = preferred_track(tracks, 2) or right
                 end
-                if left ~= previous_left or right ~= previous_right then apply(true) end
+                local reopen = ours and not mp.get_property("current-ao")
+                if left ~= previous_left or right ~= previous_right or reopen then apply(true, reopen) end
                 if ours then set_af(true) end
-                mp.commandv("ao-reload")
+                if not reopen then mp.commandv("ao-reload") end
                 publish()
                 job.done()
             else
@@ -879,18 +887,29 @@ local function pause_for_dropout()
 end
 
 -- Anyone resuming (Space) takes over: nothing left to resume.
+local function cancel_resume()
+    if resume_timer then resume_timer:kill(); resume_timer = nil end
+end
+
 mp.observe_property("pause", "bool", function(_, paused)
     if paused then return end
     we_paused = false
-    if resume_timer then resume_timer:kill(); resume_timer = nil end
+    cancel_resume()
 end)
 
 -- Counts down `secs` on screen, then plays on - if dropped-out headphones
 -- paused a playing movie. False if there is nothing to resume.
 local function resume_soon(secs)
-    if not (we_paused and opts.auto_resume) then return false end
-    if resume_timer then resume_timer:kill() end
+    if not (we_paused and opts.auto_resume) or next(lost) then return false end
+    cancel_resume()
     local function tick()
+        if next(lost) then return cancel_resume() end
+        -- The helper finishing does not mean mpv has opened its output yet.
+        -- Failed opens are retried by check_ao; never play on without sound.
+        if not mp.get_property("current-ao") then
+            resume_timer = mp.add_timeout(0.1, tick)
+            return
+        end
         if secs <= 0 then
             resume_timer, we_paused = nil, false
             mp.set_property_bool("pause", false)
@@ -952,6 +971,7 @@ mp.register_script_message("outputs", function(...)
         end
     end
     if #gone > 0 then
+        cancel_resume()
         publish()
         if grace then grace:kill() end
         grace = mp.add_timeout(opts.dropout_grace, function()
@@ -987,30 +1007,45 @@ end)
 -- new file starts right after the headphones blinked: build it again, a
 -- few times per file. Missing headphones wait for the outputs message.
 local ao_tries = 0
-local function check_ao()
-    if not (can_combine() and ours) or calib or next(lost) or #queue > 0 or loading then return end
+local ao_timer
+local check_ao
+local function schedule_ao()
+    if ao_timer then return end
+    ao_timer = mp.add_timeout(1, function()
+        ao_timer = nil
+        check_ao()
+    end)
+end
+
+check_ao = function()
+    if not (can_combine() and ours) or calib or next(lost) or loading then return end
     if not mp.get_property("path") then return end
-    if mp.get_property("current-ao") then
-        ao_tries = 0
-        return
-    end
+    if #queue > 0 then return schedule_ao() end
+    if mp.get_property("current-ao") then return end
+    pause_for_dropout()
     if ao_tries >= 3 then
+        cancel_resume()
         return say("Dual audio: no sound, the headphones' device would not open.\n"
             .. "Pick the headphones under Device in the bubbaTV menu to retry.", 10)
     end
     ao_tries = ao_tries + 1
     msg.info(string.format("%s no audio output, building the combined device again (try %d; %s)",
         clock(), ao_tries, where()))
-    pause_for_dropout()
     combine(function() return devices end, function() resume_soon(0) end)
+    -- A failed open leaves current-ao absent: no property change or restart
+    -- event will ask again. Also recheck after a failed or slow helper.
+    schedule_ao()
 end
 if pairs_mode then
-    mp.register_event("playback-restart", function() mp.add_timeout(1, check_ao) end)
+    mp.register_event("playback-restart", schedule_ao)
     mp.observe_property("current-ao", "string", function(_, ao)
-        if not ao then mp.add_timeout(1, check_ao) end
+        if not ao then schedule_ao() end
     end)
     mp.register_event("start-file", function() ao_tries = 0 end)
     mp.register_event("end-file", function(e)
+        if ao_timer then ao_timer:kill(); ao_timer = nil end
+        cancel_resume()
+        we_paused = false
         msg.info(string.format("%s end of file (%s)", clock(), e.reason or "?"))
     end)
 end
@@ -1079,6 +1114,7 @@ end
 -- same playlist opened again goes on at that file (resume_episode).
 local last_store = store_path(opts.last_file)
 local resumed = false   -- the first file of this run has been looked at
+local last_state        -- snapshot before mpv clears the file's properties
 
 local function playlist_paths()
     local list = {}
@@ -1088,16 +1124,17 @@ local function playlist_paths()
     return list
 end
 
-local function save_last(finished)
+local function save_last()
     local index = mp.get_property_number("playlist-pos", -1)
     -- Quitting, the file is gone before the last events: keep the last save.
     if not last_store or index < 0 or calib or not mp.get_property("path") then return end
-    write_store(last_store, { playlist = playlist_paths(), index = index,
-        title = mp.get_property("filename/no-ext"), time = mp.get_property_number("time-pos"),
-        finished = finished or nil })
+    last_state = { playlist = playlist_paths(), index = index,
+        title = mp.get_property("filename/no-ext"), time = mp.get_property_number("time-pos") }
+    write_store(last_store, last_state)
 end
 
 mp.register_event("start-file", function()
+    last_state = nil
     if resumed then return end
     resumed = true
     local last = opts.resume_episode and read_store(last_store, nil)
@@ -1114,15 +1151,17 @@ mp.register_event("start-file", function()
     end
 end)
 mp.register_event("file-loaded", function() save_last() end)
+mp.add_hook("on_unload", 50, function() save_last() end)
 mp.observe_property("pause", "bool", function(_, paused) if paused then save_last() end end)
 mp.add_periodic_timer(10, function()
     if mp.get_property("path") and not mp.get_property_bool("pause") then save_last() end
 end)
--- The last file played to its end: nothing to continue.
+-- end-file arrives after the playback properties are gone. Use the snapshot
+-- taken on unload to mark only the completed final entry as finished.
 mp.register_event("end-file", function(e)
-    if e.reason == "eof" and mp.get_property_number("playlist-pos", -1)
-            >= mp.get_property_number("playlist-count", 0) - 1 then
-        save_last(true)
+    if e.reason == "eof" and last_state and last_state.index == #last_state.playlist - 1 then
+        last_state.finished = true
+        write_store(last_store, last_state)
     end
 end)
 
