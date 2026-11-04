@@ -19,7 +19,13 @@
 import Cocoa
 import UniformTypeIdentifiers
 
-let dualplay = Bundle.main.object(forInfoDictionaryKey: "BubbaTVDualplay") as? String ?? ""
+let bundledPlayer = Bundle.main.object(forInfoDictionaryKey: "BubbaTVBundledPlayer") as? Bool == true
+let distribution = Bundle.main.object(forInfoDictionaryKey: "BubbaTVDistribution") as? String ?? "checkout"
+let homebrewFormula = Bundle.main.object(forInfoDictionaryKey: "BubbaTVHomebrewFormula") as? String
+    ?? "chucheloff/multilingual-player/bubbatv"
+let dualplay = bundledPlayer
+    ? Bundle.main.resourceURL?.appendingPathComponent("Player/dualplay").path ?? ""
+    : Bundle.main.object(forInfoDictionaryKey: "BubbaTVDualplay") as? String ?? ""
 // Apps started from the Dock get a bare PATH, without Homebrew.
 let path = Bundle.main.object(forInfoDictionaryKey: "BubbaTVPath") as? String
     ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
@@ -133,6 +139,15 @@ func command(_ files: [String], on: Pairs, ordered: Bool = false) throws(Problem
 /// if its own code changed, the app itself. What happened, and whether the
 /// app has to start again to be the new one.
 func update() -> (Problem, relaunch: Bool) {
+    if distribution == "homebrew" {
+        return (Problem(title: "Update with Homebrew", detail:
+            "This copy is managed by Homebrew. In Terminal, run:\n\nbrew update\nbrew upgrade \(homebrewFormula)\n\n"
+            + "Then quit and reopen bubbaTV."), false)
+    }
+    if bundledPlayer {
+        return (Problem(title: "Update bubbaTV", detail:
+            "Replace this app with a newer release. Your recent media and playback settings are kept separately."), false)
+    }
     func git(_ args: [String]) -> (Int32, String) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
@@ -271,7 +286,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let bar = NSMenu()
         let application = NSMenu(title: "bubbaTV")
         application.addItem(withTitle: "About bubbaTV", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
-        let update = application.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+        let update = application.addItem(withTitle: distribution == "homebrew" ? "Update with Homebrew…" : "Check for Updates…",
+                                         action: #selector(checkForUpdates), keyEquivalent: "")
         update.target = self
         application.addItem(.separator())
         application.addItem(withTitle: "Hide bubbaTV", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
@@ -542,6 +558,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 struct BubbaTV {
     @MainActor static func main() {
         let args = Array(CommandLine.arguments.dropFirst())
+        if args.first == "--version" {
+            print("bubbaTV " + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"))
+            return
+        }
         if args.first == "--dry-run" {
             do {
                 var on = pairs()

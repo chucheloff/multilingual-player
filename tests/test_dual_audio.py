@@ -7,6 +7,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -2158,6 +2159,9 @@ class App(unittest.TestCase):
         self.assertEqual(info["BubbaTVPath"], self.path + ":/opt/homebrew/bin:/usr/local/bin")
         self.assertEqual(info["CFBundleIconFile"], "bubbaTV.icns")
         self.assertGreater(os.path.getsize(os.path.join(self.app, "Contents", "Resources", "bubbaTV.icns")), 1000)
+        self.assertFalse(info["BubbaTVBundledPlayer"])
+        version = subprocess.check_output([os.path.join(self.app, "Contents", "MacOS", "bubbaTV"), "--version"], text=True)
+        self.assertEqual(version.strip(), "bubbaTV 0.1.0")
         # Offered for movies and folders of episodes, never their default app.
         types = info["CFBundleDocumentTypes"]
         self.assertEqual({t["LSHandlerRank"] for t in types}, {"Alternate"})
@@ -2192,6 +2196,36 @@ class App(unittest.TestCase):
         self.assertEqual(out.returncode, 1)
         self.assertIn("is not bubbaTV", out.stderr)
         self.assertTrue(os.path.exists(other))
+
+    def test_standalone_bundle_survives_relocation_without_build_sources(self):
+        app = os.path.join(self.tmp.name, "Standalone.app")
+        runtime_path = os.path.dirname(shutil.which("mpv")) + ":/usr/bin:/bin:/usr/sbin:/sbin"
+        subprocess.run([os.path.join(ROOT, "tools", "make-app.sh"), "--standalone", app], check=True,
+                       capture_output=True, timeout=300,
+                       env=dict(os.environ, BUBBATV_DISTRIBUTION="homebrew", BUBBATV_RUNTIME_PATH=runtime_path,
+                                MPV_HOME=os.path.join(self.tmp.name, "profile")))
+        moved = os.path.join(self.tmp.name, "Moved player.app")
+        shutil.move(app, moved)
+        with open(os.path.join(moved, "Contents", "Info.plist"), "rb") as f:
+            info = plistlib.load(f)
+        self.assertTrue(info["BubbaTVBundledPlayer"])
+        self.assertEqual(info["BubbaTVDualplay"], "")
+        self.assertEqual(info["BubbaTVDistribution"], "homebrew")
+        self.assertEqual(info["BubbaTVPath"], runtime_path)
+        player = os.path.join(moved, "Contents", "Resources", "Player")
+        self.assertFalse(os.path.exists(os.path.join(player, "tools", "audio-pairs.swift")))
+        self.assertFalse(os.path.exists(os.path.join(player, "tools", "bubbatv-menu.swift")))
+        for binary in ("audio-pairs", "bubbatv.so"):
+            self.assertTrue(os.path.exists(os.path.join(player, "tools", ".build", binary)))
+        output = subprocess.check_output([os.path.join(moved, "Contents", "MacOS", "bubbaTV"),
+                                          "--dry-run", TONES], text=True)
+        self.assertEqual(shlex.split(output)[0], os.path.join(player, "dualplay"))
+        subprocess.run([os.path.join(player, "dualplay"), "-B"], check=True, timeout=60,
+                       env=dict(os.environ, PATH="/usr/bin:/bin"))
+        subprocess.run([os.path.join(player, "dualplay"), TONES, "--no-config", "--vo=null", "--ao=null",
+                        "--end=0.2", "--really-quiet"], check=True, timeout=30,
+                       env=dict(os.environ, PATH=runtime_path, MPV_HOME=os.path.join(self.tmp.name, "profile")))
+        subprocess.run(["codesign", "--verify", "--strict", moved], check=True, capture_output=True)
 
     def test_two_pairs_with_two_bluetooth_outputs(self):
         for bluetooth, pairs in ((0, ""), (1, ""), (2, "-2 "), (3, "")):
@@ -2287,6 +2321,20 @@ class AppHome(unittest.TestCase):
 
     def test_history_persists_and_only_shows_available_media(self):
         self.check("history")
+
+    def test_homebrew_update_uses_package_manager_instead_of_git(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = os.path.join(tmp, "HomeTests.app")
+            shutil.copytree(self.app, app)
+            plist = os.path.join(app, "Contents", "Info.plist")
+            with open(plist, "rb") as f:
+                info = plistlib.load(f)
+            info["BubbaTVDistribution"] = "homebrew"
+            with open(plist, "wb") as f:
+                plistlib.dump(info, f)
+            result = subprocess.run([os.path.join(app, "Contents", "MacOS", "bubbaTV"), "homebrew-update", tmp],
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_continue_keeps_the_current_file_when_earlier_files_disappear(self):
         self.check("resume")

@@ -15,6 +15,36 @@ to hear a line again, as do left/right mouse double-clicks, and a folder of
 episodes plays one after another. The
 **bubbaTV** app starts a movie without the terminal.
 
+## Install with Homebrew
+
+Requires macOS 14 or later and Swift 6 (Xcode 16 Command Line Tools or newer).
+The repository is private, so Git must already have access to it. Homebrew
+uses the same Git credentials when fetching the tap and source.
+
+```sh
+brew tap chucheloff/multilingual-player https://github.com/chucheloff/multilingual-player.git
+brew install chucheloff/multilingual-player/bubbatv
+bubbatv
+```
+
+The formula installs mpv as a dependency, builds a self-contained app, and
+adds the `bubbatv` and `dualplay` commands. `bubbatv movie.mkv` opens media;
+`bubbatv --version` shows the installed version. The app has its launcher,
+Lua script, and compiled helpers inside its bundle, so playback needs no
+source checkout or compiler.
+
+Keep the running app in the Dock, or add a shortcut in Applications:
+
+```sh
+ln -s "$(brew --prefix bubbatv)/bubbaTV.app" ~/Applications/bubbaTV-homebrew.app
+```
+
+The distinct shortcut name lets a development app and a Homebrew app coexist.
+To update the Homebrew copy, run `brew update` followed by
+`brew upgrade chucheloff/multilingual-player/bubbatv`; its **Update with
+Homebrew…** menu shows these commands. Settings and recent media are kept
+outside the app and survive upgrades.
+
 ## Quick start
 
 ```sh
@@ -111,6 +141,10 @@ The home window also offers:
 - `make-app.sh` replaces an older bubbaTV, but never another app of that name.
   Without an argument it builds `tools/.build/bubbaTV.app`. To see
   what the app would run: `~/Applications/bubbaTV.app/Contents/MacOS/bubbaTV --dry-run movie.mkv`.
+- For a relocatable bundle, use `tools/make-app.sh --standalone /path/to/bubbaTV.app`.
+  This compiles and embeds the playback helpers before signing; mpv remains
+  an external dependency. The default build follows this checkout and is
+  suitable for development.
 - If macOS asks whether bubbaTV may access a folder (Downloads, Documents…),
   allow it: mpv reads the movie on its behalf.
 

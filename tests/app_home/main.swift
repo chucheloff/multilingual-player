@@ -27,6 +27,15 @@ func wait(_ description: String, _ predicate: () -> Bool) {
     exit(1)
 }
 
+if mode == "homebrew-update" {
+    let result = update()
+    check(result.0.title == "Update with Homebrew", "Homebrew installs do not run git updates")
+    check(result.0.detail.contains("brew upgrade chucheloff/multilingual-player/bubbatv"), "Homebrew upgrade command")
+    check(!result.relaunch, "update guidance does not relaunch the app")
+    print("ok homebrew update")
+    exit(0)
+}
+
 if mode == "history" {
     let file = root.appendingPathComponent("profile/recent.json")
     let history = RecentMedia(file: file)
