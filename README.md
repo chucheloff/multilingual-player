@@ -62,13 +62,25 @@ tools/make-app.sh ~/Applications/bubbaTV.app
 
 Then drop a movie or a [folder of episodes](#a-folder-of-episodes) on
 **bubbaTV** (keep it in the Dock, or in Finder), or right-click one → Open
-With → bubbaTV. Opened on its own, it offers to pick one. It plays with
-`dualplay`: on two pairs (`-2`) when exactly two Bluetooth
-headphones are connected, otherwise on one shared pair, an ear each. The
+With → bubbaTV. It plays with `dualplay`: on two pairs (`-2`) when exactly
+two Bluetooth headphones are connected, otherwise on one shared pair, an ear
+each. With more than two (a Bluetooth speaker too), the two headphones that
+played before are the pairs; if that doesn't settle it, bubbaTV asks which
+two, or offers one shared pair. The
 languages are `left_lang` / `right_lang` from `dual_audio.conf` (see
 [Install as a plugin](#install-as-a-plugin)); without them, the track that
 would normally play comes first. Several files or folders play as a playlist, in name
 order. bubbaTV quits when mpv does, and quitting bubbaTV stops mpv.
+
+Opened on its own (click it in the Dock), bubbaTV offers:
+
+- **Continue “…” at 12:34** — what played last, where you quit: the same
+  movie, or the same folder of episodes at the episode you were on.
+- **Choose Movie…**
+- **Check for Updates** — `git pull` in this folder, then it rebuilds what
+  changed (the helpers, the menu, and the app itself, which then opens
+  again) and lists what's new. A folder with changes of its own is left
+  alone.
 
 - It is only offered under Open With: it never becomes the default app for movies or folders.
 - Built into `/Applications` or `~/Applications`, it is under Open With straight
@@ -76,7 +88,8 @@ order. bubbaTV quits when mpv does, and quitting bubbaTV stops mpv.
   has been opened. If Finder still doesn't list it, relaunch Finder
   (Option-right-click its Dock icon → Relaunch).
 - Problems (mpv not installed, nothing to play, playback failing) show up in an alert.
-  mpv's output is in `~/Library/Logs/bubbaTV.log`.
+  mpv's output is in `~/Library/Logs/bubbaTV.log`, with times and without
+  mpv's status line; the two runs before are `bubbaTV.1.log` and `bubbaTV.2.log`.
 - The app runs `dualplay` from this folder (the path is built in), so a
   `git pull` here updates it too, and what `dualplay` compiles stays in
   `tools/.build`, not in the app. If you move the folder, run `make-app.sh`
@@ -107,11 +120,30 @@ other pair's and the two swap). Switching takes a few seconds of silence.
 The headphones bring their own loudness and delay
 ([remembered](#remembered-per-headphones)).
 
-**Headphones that drop out** (flat battery, out of range) pause the movie,
-and the screen says which pair it was. Reconnect them (Control Center →
-Bluetooth); once they're back the sound is set up again and the screen says
-to press Space. If that fails, the screen says why: pick the headphones in
-**Device** again to retry.
+**Headphones that drop out** (flat battery, out of range) pause the movie
+once they've been gone for 2 seconds, and the screen says which pair it
+was. Reconnect them (Control Center → Bluetooth); once they're back the
+sound is set up again and the movie plays on by itself after a 3-second
+countdown (Space: right away), if it was playing when they went. If that
+fails, the screen says why: pick the headphones in **Device** again to retry.
+
+- Headphones back within the 2 seconds (Bluetooth blinking for a moment)
+  don't stop the movie: the sound is set up again, which pauses it for a few
+  seconds, and it plays on.
+- If mpv can't open the headphones' sound when a new episode starts, the
+  device is built again, up to three times, instead of playing without sound.
+- Every change of the connected outputs goes to the log, with the time and
+  where playback was, e.g.
+  `[dual_audio] 21:14:03 outputs -Nikita’s AirPods Pro (12:41 into S01E04.mkv, playing)`,
+  and so does how long headphones were gone.
+- While paused, mpv keeps sending silence (`--audio-stream-silence`), so the
+  headphones' Bluetooth link stays busy instead of idling.
+- **AirPods that switch to an iPhone**: on the iPhone, Settings → Bluetooth →
+  ⓘ next to the AirPods → Connect to This iPhone → **When Last Connected to
+  This iPhone**. Otherwise the iPhone may take them over whenever the movie
+  is quiet, which looks like a dropout here.
+- `dropout_grace`, `auto_resume` and `resume_countdown` ([options](#install-as-a-plugin))
+  change the 2 seconds, playing on by itself, and the countdown.
 
 Volume: `9` / `0` changes both, `h` / `k` makes one pair quieter than the other,
 and the bubbaTV menu sets each pair's loudness on its own.
@@ -193,8 +225,8 @@ picture:
 - Headphones that drop out meanwhile keep the movie paused after Done.
 - It has no key of its own: `Alt+c script-binding dual_audio/calibrate` in
   `input.conf` gives it one (press it again for Done).
-- Quit after Done, not while calibrating: `Shift+Q` would save the pattern's
-  position, and the hidden subtitles, for the next start.
+- Quitting while calibrating keeps the movie's position from before it
+  started, not the pattern's.
 
 ## Subtitles in both languages
 
@@ -281,6 +313,7 @@ they last only until mpv quits.
 | `h` / `k` | balance: make the left ear / first pair louder, or the other side (2 dB steps) |
 | `←` / `→` | back / forward exactly 5 s, to hear a line again (hold to keep going) |
 | Left / right mouse double-click | back / forward exactly 5 s on the video |
+| `#` | with dual audio on: shows which keys switch the tracks (mpv's own `#` can't) |
 
 Shift is required so a stray keypress can't switch the language mid-movie.
 `{` / `}` take over mpv's halve / double speed keys; `[` / `]` still change the
@@ -351,6 +384,15 @@ follow_subs=yes
 devices_file=~~/dual_audio-devices.json
 # per-device languages and file/playlist track choices
 tracks_file=~~/dual_audio-tracks.json
+# two pairs: seconds headphones may vanish before the movie pauses; playing on
+# by itself once they're back, after a countdown of this many seconds
+dropout_grace=2
+auto_resume=yes
+resume_countdown=3
+# what played last, for bubbaTV's Continue; resume_episode: the same
+# playlist opened again goes on at the episode watched last
+last_file=~~/dual_audio-last.json
+resume_episode=yes
 ```
 
 ## Good to know
@@ -358,8 +400,15 @@ tracks_file=~~/dual_audio-tracks.json
 - **Separate dub file:** `./dualplay -r rus movie.mkv --audio-file=movie.rus.mka`
 - **Series:** in a playlist, the next episode keeps the languages you chose;
   give `dualplay` the season's folder ([above](#a-folder-of-episodes)).
-- **Quit and resume** (`Shift+Q`) saves your own audio delay (`Ctrl+-` / `Ctrl++`)
-  as mpv does; the pairs' delays come back from their headphones.
+- **Quit and resume:** `dualplay` saves the position on every quit (`q`,
+  closing the window, quitting bubbaTV), so a movie opened again goes on
+  where you were (`--save-position-on-quit=no` after the file name turns
+  that off). A folder of episodes opened again goes on at the episode you
+  were on; pick another under Files in the bubbaTV menu. Your own audio
+  delay (`Ctrl+-` / `Ctrl++`) is saved too, as mpv does; the pairs' delays
+  come back from their headphones.
+- **`dualplay -B`** builds the helper and the bubbaTV menu if they are out of
+  date, without playing anything (bubbaTV's Check for Updates runs it).
 - **With one shared pair, each ear gets a mono downmix** of its track. For 5.1 tracks the centre
   channel (dialogue) keeps its full level, so a stereo and a 5.1 track sound
   about equally loud. If one is quieter, use `h` / `k`.
