@@ -86,6 +86,9 @@ local grace             -- pairs mode: timer while missing headphones may still 
 local we_paused = false -- pairs mode: dropped-out headphones paused a playing movie
 local resume_timer      -- pairs mode: the countdown to playing on again
 local queue = {}        -- pairs mode: device changes for the helper, the running one first
+local combine, reset_recovery -- defined with the helper queue and recovery timers below
+local pair_output = mp.get_property("audio-device", "auto")
+local pair_channels = mp.get_property("audio-channels", "quad")
 
 -- The pairs play on one device combining both headphones (dualplay -2), so
 -- the helper that built it can build it again from other headphones.
@@ -577,7 +580,7 @@ local function apply(live, reopen)
     local pos = live and (back and back.pos or mp.get_property_number("time-pos"))
     -- Our --af filter goes in after the graph and out before it, so it only
     -- ever gets the joined channels.
-    if not want then set_af(false) end
+    if not want or reopen then set_af(false) end
     -- A failed audio output drops mpv's audio chain. ao-reload alone cannot
     -- restore it: detach and reattach the graph, keeping the position above.
     if reopen then mp.set_property("lavfi-complex", "") end
@@ -597,8 +600,8 @@ local function apply(live, reopen)
         mp.commandv("drop-buffers")
         mp.commandv("seek", pos, "absolute+exact")
     end
-    -- Headphones that dropped out meanwhile keep the movie paused.
-    if back then mp.set_property_bool("pause", back.pause or next(lost) ~= nil) end
+    -- Missing headphones keep the movie paused while dual audio is on.
+    if back then mp.set_property_bool("pause", back.pause or (enabled and next(lost) ~= nil)) end
     publish()
 end
 
@@ -633,8 +636,20 @@ end
 
 local function toggle()
     enabled = not enabled
+    if can_combine() then
+        reset_recovery()
+        -- A single listener must not depend on the aggregate's other pair.
+        -- Restore the launcher's output and layout when both listen again.
+        mp.set_property("audio-channels", enabled and pair_channels or "stereo")
+        mp.set_property("audio-device", enabled and pair_output or "auto")
+    end
     apply(true)
     show()
+    if can_combine() and enabled then
+        -- Devices may have come and gone while dual audio was off, including
+        -- changes for which the menu never delivered an outputs notification.
+        combine(function() return devices end, show)
+    end
 end
 
 -- Next track for one side, the other side's track included.
@@ -813,6 +828,7 @@ local function run_queue()
     local job = queue[1]
     if not job then return end
     local names = job.want()
+    local outputs_before = connected
     mp.command_native_async({ name = "subprocess", args = { opts.helper, "create", names[1], names[2] },
                               capture_stdout = true, capture_stderr = true, playback_only = false },
         function(_, r)
@@ -822,9 +838,14 @@ local function run_queue()
                 local first, second = r.stdout:match("^[^\t]*\t([^\t]*)\t([^\t\n]*)")
                 devices = { first or names[1], second or names[2] }
                 lost = {}
-                -- Outputs may have changed while the helper was running.
+                -- The helper checked both devices. Only newer output reports
+                -- can mark them missing again, including during this rebuild.
                 for i = 1, 2 do
-                    if connected and not connected[devices[i]] then lost[i] = true end
+                    if connected and connected ~= outputs_before and not connected[devices[i]] then
+                        lost[i] = true
+                    else
+                        gone_at[i] = nil
+                    end
                 end
                 -- Other headphones bring their own loudness and delay. The
                 -- reopened output gets our filter built anew from its
@@ -836,12 +857,18 @@ local function run_queue()
                     left = preferred_track(tracks, 1) or left
                     right = preferred_track(tracks, 2) or right
                 end
-                local reopen = ours and not mp.get_property("current-ao")
-                if left ~= previous_left or right ~= previous_right or reopen then apply(true, reopen) end
-                if ours then set_af(true) end
-                if not reopen then mp.commandv("ao-reload") end
+                if enabled then
+                    local reopen = ours and not mp.get_property("current-ao")
+                    if left ~= previous_left or right ~= previous_right or reopen then
+                        apply(true, reopen)
+                    end
+                    if ours then set_af(true) end
+                    if not reopen then mp.commandv("ao-reload") end
+                end
                 publish()
-                job.done()
+                -- A rebuild can finish after the user has switched to one
+                -- pair. Leave that output playing and do not announce a retry.
+                if enabled then job.done() end
             else
                 local why = (r and r.stderr or ""):gsub("^audio%-pairs: ", ""):gsub("%s+$", "")
                 say("Dual audio: could not switch the headphones\n"
@@ -851,7 +878,7 @@ local function run_queue()
         end)
 end
 
-local function combine(want, done)
+combine = function(want, done)
     queue[#queue + 1] = { want = want, done = done }
     if #queue == 1 then run_queue() end
 end
@@ -900,10 +927,10 @@ end)
 -- Counts down `secs` on screen, then plays on - if dropped-out headphones
 -- paused a playing movie. False if there is nothing to resume.
 local function resume_soon(secs)
-    if not (we_paused and opts.auto_resume) or next(lost) then return false end
+    if not (enabled and we_paused and opts.auto_resume) or next(lost) then return false end
     cancel_resume()
     local function tick()
-        if next(lost) then return cancel_resume() end
+        if not enabled or next(lost) then return cancel_resume() end
         -- The helper finishing does not mean mpv has opened its output yet.
         -- Failed opens are retried by check_ao; never play on without sound.
         if not mp.get_property("current-ao") then
@@ -970,6 +997,9 @@ mp.register_script_message("outputs", function(...)
             back[#back + 1] = i
         end
     end
+    -- Remember missing pairs for the menu, but single-output playback does
+    -- not need them. Rebuild only when dual audio is enabled again.
+    if not enabled then return publish() end
     if #gone > 0 then
         cancel_resume()
         publish()
@@ -1008,6 +1038,13 @@ end)
 -- few times per file. Missing headphones wait for the outputs message.
 local ao_tries = 0
 local ao_timer
+reset_recovery = function()
+    if grace then grace:kill(); grace = nil end
+    if ao_timer then ao_timer:kill(); ao_timer = nil end
+    cancel_resume()
+    we_paused, ao_tries = false, 0
+end
+
 local check_ao
 local function schedule_ao()
     if ao_timer then return end
