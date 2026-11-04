@@ -113,7 +113,10 @@ func pick(_ names: [String]) -> [Device] {
         return bluetooth
     }
     let chosen = names.map { name in
-        let matches = all.filter { $0.name.localizedCaseInsensitiveContains(name) }
+        // A full name (what bubbaTV passes) is that device, even when it is
+        // part of another's name too ("AirPods" and "AirPods Pro").
+        let exact = all.filter { $0.name == name }
+        let matches = exact.count == 1 ? exact : all.filter { $0.name.localizedCaseInsensitiveContains(name) }
         guard matches.count == 1 else {
             fail("\"\(name)\" matches \(matches.count) outputs. Outputs:\n" + describe(all))
         }

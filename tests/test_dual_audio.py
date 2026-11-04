@@ -7,6 +7,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -622,12 +623,21 @@ class Keys(Playing):
         # mpv builds the --af filter anew from its string when it reopens
         # the audio output (another output device, ao-reload), too.
         self.press("a", (1, 2))
+        # Let the toggle's seek and audio-reconfig finish before testing a
+        # live command; an uninitialized filter legitimately uses set_af.
+        self.mpv.command("set_property", "pause", False)
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") > 3.3)
+        self.mpv.command("set_property", "pause", True)
+        position = self.mpv.get("time-pos")
         self.message("set-gain", 2, -6)
         self.wait_sides([(0, 0), (-6, 0)])
         self.assertIn("volume@dual_audio2=0dB", self.af_graph())  # live
         self.mpv.command("ao-reload")
         self.af_has("volume@dual_audio2=-6dB")
-        self.expect((1, 2))
+        self.assertEqual(re.findall(r"\[aid(\d+)\]", self.mpv.get("lavfi-complex")), ["1", "2"])
+        self.assertTrue(self.state()["active"])
+        self.assertEqual([s["track"] for s in self.state()["sides"]], [1, 2])
+        self.assertAlmostEqual(self.mpv.get("time-pos"), position, delta=0.05)
 
     def test_own_filters_left_alone(self):
         # Ours goes first, on the joined channels; the user's come after,
@@ -1165,12 +1175,17 @@ class Devices(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.helper, self.calls = fake_helper(self.tmp.name)
         self.log = os.path.join(self.tmp.name, "mpv.log")
+        self.start()
+
+    def start(self, *opts):
         self.mpv = Mpv(self.tmp.name, "--start=3", "--pause", "--audio-channels=quad",
+                       "--audio-device=coreaudio/com.multilingual-player.audio-pairs",
+                       "--ao-pcm-file=" + os.path.join(self.tmp.name, "missing", "audio.wav"),
                        "--log-file=" + self.log,
                        "--script-opts-append=dual_audio-auto=yes",
                        "--script-opts-append=dual_audio-mode=pairs",
                        "--script-opts-append=dual_audio-pair_names=Nikita’s AirPods|Friend, Pro",
-                       "--script-opts-append=dual_audio-helper=" + self.helper)
+                       "--script-opts-append=dual_audio-helper=" + self.helper, *opts)
         self.mpv.wait_for(lambda: self.mpv.get("time-pos") is not None)
 
     def tearDown(self):
@@ -1194,6 +1209,132 @@ class Devices(unittest.TestCase):
 
     def wait_lost(self, lost):
         self.mpv.wait_for(lambda: [s.get("lost", False) for s in self.sides()] == lost)
+
+    def toggle(self, enabled):
+        self.mpv.command("keypress", "a")
+        self.mpv.wait_for(lambda: self.mpv.get("user-data/dual_audio")["enabled"] == enabled)
+
+    def wait_output(self, device, channels):
+        self.mpv.wait_for(lambda: self.mpv.get("audio-device") == device
+                         and self.mpv.get("audio-channels") == channels
+                         and (self.mpv.get("audio-out-params") or {}).get("channels") == channels
+                         and self.mpv.get("current-ao") == "null")
+
+    def fail_output(self):
+        # Fail a real AO without touching CoreAudio: PCM cannot write into a
+        # nonexistent directory. Returning to null alone does not revive it.
+        self.mpv.command("set_property", "ao", "pcm")
+        self.mpv.command("ao-reload")
+        self.mpv.wait_for(lambda: self.mpv.get("current-ao") is None)
+        self.mpv.command("set_property", "ao", "null")
+
+    def test_single_output_and_back(self):
+        self.message("set-track", 1, 3)
+        self.mpv.wait_for(lambda: self.sides()[0]["track"] == 3)
+        self.message("set-gain", 2, -6)
+        self.message("set-delay", 2, 120)
+        self.mpv.wait_for(lambda: (self.sides()[1]["gain"], self.sides()[1]["delay"]) == (-6, 120))
+        self.toggle(False)
+        self.wait_output("auto", "stereo")
+        self.assertEqual(self.mpv.get("lavfi-complex"), "")
+        self.assertFalse(any(f.get("label") == "dual_audio" for f in self.mpv.get("af")))
+        self.assertEqual(self.mpv.get("aid"), 3)
+        self.mpv.command("set_property", "pause", False)
+        self.message("outputs", "Nikita’s AirPods", "MacBook Pro Speakers")
+        self.wait_lost([False, True])
+        self.assertFalse(self.mpv.get("pause"))
+        self.assertEqual(self.calls(), [])
+        self.message("outputs", "Nikita’s AirPods", "Friend, Pro", "MacBook Pro Speakers")
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") > 3.5)
+        self.assertEqual(self.calls(), [])  # reconnection while off must not rebuild
+        self.mpv.command("set_property", "pause", True)
+        pos = self.mpv.get("time-pos")
+        self.toggle(True)
+        self.mpv.wait_for(lambda: len(self.calls()) == 1)
+        self.wait_lost([False, False])
+        self.wait_output("coreaudio/com.multilingual-player.audio-pairs", "quad")
+        self.assertEqual([s["track"] for s in self.sides()], [3, 2])
+        self.af_has("volume@dual_audio2=-6dB", "delays=0|0|120|120")
+        self.assertAlmostEqual(self.mpv.get("time-pos"), pos, delta=0.05)
+        self.assertTrue(self.mpv.get("pause"))
+
+    def test_enable_rebuilds_without_device_notifications(self):
+        self.message("outputs", "Nikita’s AirPods")
+        self.wait_lost([False, True])
+        self.toggle(False)
+        # Both are available to the helper again, but no outputs message arrived.
+        self.toggle(True)
+        self.mpv.wait_for(lambda: self.calls() == ["create|Nikita’s AirPods|Friend, Pro"])
+        self.wait_lost([False, False])
+        self.wait_output("coreaudio/com.multilingual-player.audio-pairs", "quad")
+
+    def test_disable_after_output_failure(self):
+        self.fail_output()
+        self.toggle(False)
+        self.wait_output("auto", "stereo")
+        self.assertEqual(self.mpv.get("aid"), 1)
+        self.assertAlmostEqual(self.mpv.get("time-pos"), 3.0, delta=0.05)
+
+    def test_reconnect_after_output_failure(self):
+        self.message("outputs", "Nikita’s AirPods")
+        self.wait_lost([False, True])
+        self.fail_output()
+        self.message("outputs", "Nikita’s AirPods", "Friend, Pro")
+        self.wait_lost([False, False])
+        self.wait_output("coreaudio/com.multilingual-player.audio-pairs", "quad")
+        self.assertIn("[aid1]", self.mpv.get("lavfi-complex"))
+        self.assertIn("[aid2]", self.mpv.get("lavfi-complex"))
+        self.mpv.wait_for(lambda: abs(self.mpv.get("time-pos") - 3.0) < 0.05)
+
+    def test_disable_during_rebuild(self):
+        self.message("set-device", 2, "Other Phones")
+        self.mpv.wait_for(lambda: len(self.calls()) == 1)
+        self.toggle(False)
+        self.wait_output("auto", "stereo")
+        self.mpv.wait_for(lambda: self.devices() == ["Nikita’s AirPods", "Other Phones"])
+        self.wait_output("auto", "stereo")
+        self.assertEqual(self.mpv.get("lavfi-complex"), "")
+        self.assertFalse(self.mpv.get("user-data/dual_audio")["active"])
+
+    def test_disable_during_dropout_grace(self):
+        self.mpv.close()
+        self.start("--script-opts-append=dual_audio-dropout_grace=0.5")
+        self.mpv.command("set_property", "pause", False)
+        self.message("outputs", "Nikita’s AirPods")
+        self.wait_lost([False, True])
+        self.toggle(False)
+        self.wait_output("auto", "stereo")
+        position = self.mpv.get("time-pos")
+        time.sleep(0.8)
+        self.assertFalse(self.mpv.get("pause"))
+        self.assertGreater(self.mpv.get("time-pos"), position + 0.3)
+        self.assertEqual(self.calls(), [])
+
+    def test_disable_during_resume_countdown(self):
+        self.mpv.close()
+        self.start("--script-opts-append=dual_audio-dropout_grace=0.2",
+                   "--script-opts-append=dual_audio-resume_countdown=1")
+        self.mpv.command("set_property", "pause", False)
+        self.message("outputs", "Nikita’s AirPods")
+        self.mpv.wait_for(lambda: self.mpv.get("pause"))
+        self.message("outputs", "Nikita’s AirPods", "Friend, Pro")
+        self.wait_logged("reconnected, playing on")
+        self.wait_lost([False, False])
+        self.toggle(False)
+        self.wait_output("auto", "stereo")
+        time.sleep(1.3)
+        self.assertTrue(self.mpv.get("pause"))
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_disable_while_calibrating_with_missing_pair(self):
+        self.mpv.command("set_property", "pause", False)
+        calibrate(self.mpv)
+        self.message("outputs", "Nikita’s AirPods")
+        self.wait_lost([False, True])
+        self.toggle(False)
+        self.wait_output("auto", "stereo")
+        self.assertFalse(self.mpv.get("user-data/dual_audio")["calibrating"])
+        self.assertFalse(self.mpv.get("pause"))
 
     def test_move_a_pair(self):
         self.message("set-device", 2, "Other Phones")
@@ -1259,10 +1400,62 @@ class Devices(unittest.TestCase):
         self.assertEqual(self.calls(), [])
         self.message("outputs", "Nikita’s AirPods", "Friend, Pro", "MacBook Pro Speakers")
         self.mpv.wait_for(lambda: self.calls() == ["create|Nikita’s AirPods|Friend, Pro"])
-        self.wait_logged("Pair 2 (Friend, Pro) reconnected. | Press Space to resume.")
+        self.wait_logged("Pair 2 (Friend, Pro) reconnected, playing on")
         self.mpv.wait_for(lambda: ao_inits(self.log) == 2)
         self.wait_lost([False, False])
-        self.assertTrue(self.mpv.get("pause"))  # resuming is up to the people watching
+        self.assertTrue(self.mpv.get("pause"))  # countdown before playing on
+        self.mpv.wait_for(lambda: not self.mpv.get("pause"))
+
+    def test_second_dropout_cancels_resume(self):
+        self.mpv.close()
+        self.start("--script-opts-append=dual_audio-dropout_grace=0.2",
+                   "--script-opts-append=dual_audio-resume_countdown=1")
+        self.mpv.command("set_property", "pause", False)
+        self.message("outputs", "Nikita’s AirPods")
+        self.mpv.wait_for(lambda: self.mpv.get("pause"))
+        self.message("outputs", "Nikita’s AirPods", "Friend, Pro")
+        self.wait_logged("reconnected, playing on")
+        self.wait_lost([False, False])
+        self.message("outputs", "Nikita’s AirPods")
+        self.wait_lost([False, True])
+        time.sleep(1.3)  # the original countdown must not resume missing headphones
+        self.assertTrue(self.mpv.get("pause"))
+        self.assertEqual(len(self.calls()), 1)
+        self.message("outputs", "Nikita’s AirPods", "Friend, Pro")
+        self.wait_lost([False, False])
+        self.mpv.wait_for(lambda: not self.mpv.get("pause"))
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_dropout_does_not_resume_user_pause(self):
+        self.message("outputs", "Nikita’s AirPods")
+        self.wait_logged("dropped out, so the movie is paused.")
+        self.message("outputs", "Nikita’s AirPods", "Friend, Pro")
+        self.wait_logged("reconnected. | Press Space to resume.")
+        time.sleep(3.2)
+        self.assertTrue(self.mpv.get("pause"))
+
+    def test_dropout_during_rebuild_stays_missing(self):
+        self.mpv.close()
+        with open(self.helper, "r") as f:
+            helper = f.read().replace("sleep 0.2", "sleep 0.6")
+        with open(self.helper, "w") as f:
+            f.write(helper)
+        self.start("--script-opts-append=dual_audio-dropout_grace=0.2",
+                   "--script-opts-append=dual_audio-resume_countdown=1")
+        self.mpv.command("set_property", "pause", False)
+        self.message("outputs", "Nikita’s AirPods")
+        self.mpv.wait_for(lambda: self.mpv.get("pause"))
+        self.message("outputs", "Nikita’s AirPods", "Friend, Pro")
+        self.mpv.wait_for(lambda: len(self.calls()) == 1)
+        # The output disappears before the successful helper callback arrives.
+        self.message("outputs", "Nikita’s AirPods")
+        self.mpv.wait_for(lambda: ao_inits(self.log) == 2)
+        time.sleep(1.3)
+        self.wait_lost([False, True])
+        self.assertTrue(self.mpv.get("pause"))
+        self.message("outputs", "Nikita’s AirPods", "Friend, Pro")
+        self.wait_lost([False, False])
+        self.mpv.wait_for(lambda: not self.mpv.get("pause"))
 
     def test_dropout_while_calibrating(self):
         # Done puts back the pause state from before, but headphones that
@@ -1273,6 +1466,110 @@ class Devices(unittest.TestCase):
         self.mpv.wait_for(lambda: self.mpv.get("pause"))
         calibrate(self.mpv, False)
         self.assertTrue(self.mpv.get("pause"))
+
+
+class AudioRecovery(unittest.TestCase):
+    """A missing PCM output directory fails like a device that cannot open,
+    and creating it lets real mpv audio recover without real headphones."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.helper, self.calls = fake_helper(self.tmp.name)
+        self.output = os.path.join(self.tmp.name, "missing")
+        self.log = os.path.join(self.tmp.name, "mpv.log")
+        self.mpv = None
+
+    def start(self, *opts):
+        self.mpv = Mpv(self.tmp.name, "--start=3", "--ao=pcm",
+                       "--ao-pcm-file=" + os.path.join(self.output, "out.wav"),
+                       "--log-file=" + self.log, "--audio-channels=quad",
+                       "--script-opts-append=dual_audio-auto=yes",
+                       "--script-opts-append=dual_audio-mode=pairs",
+                       "--script-opts-append=dual_audio-pair_names=Pair A|Pair B",
+                       "--script-opts-append=dual_audio-helper=" + self.helper, *opts)
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") is not None)
+
+    def tearDown(self):
+        if self.mpv:
+            self.mpv.close()
+        self.tmp.cleanup()
+
+    def test_failed_output_retries_and_stays_paused(self):
+        self.start()
+        self.mpv.wait_for(lambda: "no sound, the headphones' device would not open" in read(self.log), timeout=10)
+        self.assertEqual(len(self.calls()), 3)
+        self.assertIsNone(self.mpv.get("current-ao"))
+        self.assertTrue(self.mpv.get("pause"))
+        position = self.mpv.get("time-pos")
+        time.sleep(1.2)
+        self.assertEqual(len(self.calls()), 3)
+        self.assertAlmostEqual(self.mpv.get("time-pos"), position, delta=0.05)
+
+    def test_output_recovers_after_retry(self):
+        self.start()
+        # Initial open and first rebuild both fail; the second rebuild can open it.
+        self.mpv.wait_for(lambda: read(self.log).count("Failed to initialize audio driver 'pcm'") >= 2)
+        self.assertTrue(self.mpv.get("pause"))
+        os.mkdir(self.output)
+        self.mpv.wait_for(lambda: self.mpv.get("current-ao") == "pcm")
+        self.mpv.wait_for(lambda: not self.mpv.get("pause"))
+        self.assertEqual(len(self.calls()), 2)
+        position = self.mpv.get("time-pos")
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") > position + 0.2)
+
+    def test_recovery_keeps_user_pause(self):
+        self.start("--pause")
+        os.mkdir(self.output)
+        self.mpv.wait_for(lambda: self.mpv.get("current-ao") == "pcm")
+        time.sleep(1.2)  # allow the recovery check to run
+        self.assertTrue(self.mpv.get("pause"))
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_failed_helper_retries_are_bounded(self):
+        self.start("--script-opts-append=dual_audio-pair_names=Pair A|Broken Phones")
+        self.mpv.wait_for(lambda: "no sound, the headphones' device would not open" in read(self.log), timeout=10)
+        self.assertEqual(len(self.calls()), 3)
+        self.assertTrue(self.mpv.get("pause"))
+
+
+class LastPlayback(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.last = os.path.join(self.tmp.name, "last.json")
+        self.option = "--script-opts-append=dual_audio-last_file=" + self.last
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_finished_movie_is_not_resumable(self):
+        subprocess.run(BASE + ["--ao=null", "--start=19", self.option, TONES], check=True, timeout=15)
+        last = json.loads(read(self.last))
+        self.assertTrue(last.get("finished"))
+        self.assertEqual(last["index"], 0)
+        self.assertEqual(last["playlist"], [TONES])
+
+    def test_finished_playlist_is_not_resumable(self):
+        subprocess.run(BASE + ["--ao=null", "--start=19", self.option, TONES, SYNC], check=True, timeout=15)
+        last = json.loads(read(self.last))
+        self.assertTrue(last.get("finished"))
+        self.assertEqual(last["index"], 1)
+        self.assertEqual(last["playlist"], [TONES, SYNC])
+
+    def test_intermediate_eof_and_quit_keep_next_episode_resumable(self):
+        mpv = Mpv(self.tmp.name, "--start=19", self.option, TONES, src=SYNC)
+        try:
+            mpv.wait_for(lambda: mpv.get("playlist-pos") == 1)
+            mpv.command("set_property", "pause", True)
+            mpv.command("seek", 5, "absolute+exact")
+            mpv.wait_for(lambda: abs((mpv.get("time-pos") or 0) - 5) < 0.05)
+            mpv.quit()
+            last = json.loads(read(self.last))
+            self.assertFalse(last.get("finished", False))
+            self.assertEqual(last["index"], 1)
+            self.assertEqual(last["playlist"], [TONES, SYNC])
+            self.assertAlmostEqual(last["time"], 5, delta=0.05)
+        finally:
+            mpv.close()
 
 
 class Subs(unittest.TestCase):
@@ -1620,9 +1917,9 @@ class Menu(unittest.TestCase):
         helper, calls = fake_helper(self.tmp.name)
         outputs = self.outputs("Nikita’s AirPods", "Friend, Pro", "Other Phones")
         self.mpv.close()
-        self.start("--script-opts-append=dual_audio-helper=" + helper,
+        self.start("--script-opts-append=dual_audio-auto=yes",
+                   "--script-opts-append=dual_audio-helper=" + helper,
                    env=dict(os.environ, BUBBATV_DEVICES=outputs))
-        self.mpv.command("keypress", "a")
         self.wait_menu("Pair 1\nDevice: Nikita’s AirPods\n  [x] Nikita’s AirPods\n  Friend, Pro\n"
                        "  Other Phones\nAudio track:")
         self.assertIn("Pair 2\nDevice: Friend, Pro\n  Nikita’s AirPods\n  [x] Friend, Pro\n"
@@ -1860,6 +2157,11 @@ class App(unittest.TestCase):
         self.assertTrue(os.access(os.path.join(self.app, "Contents", "MacOS", info["CFBundleExecutable"]), os.X_OK))
         self.assertEqual(info["BubbaTVDualplay"], os.path.join(ROOT, "dualplay"))
         self.assertEqual(info["BubbaTVPath"], self.path + ":/opt/homebrew/bin:/usr/local/bin")
+        self.assertEqual(info["CFBundleIconFile"], "bubbaTV.icns")
+        self.assertGreater(os.path.getsize(os.path.join(self.app, "Contents", "Resources", "bubbaTV.icns")), 1000)
+        self.assertFalse(info["BubbaTVBundledPlayer"])
+        version = subprocess.check_output([os.path.join(self.app, "Contents", "MacOS", "bubbaTV"), "--version"], text=True)
+        self.assertEqual(version.strip(), "bubbaTV 0.1.0")
         # Offered for movies and folders of episodes, never their default app.
         types = info["CFBundleDocumentTypes"]
         self.assertEqual({t["LSHandlerRank"] for t in types}, {"Alternate"})
@@ -1895,12 +2197,43 @@ class App(unittest.TestCase):
         self.assertIn("is not bubbaTV", out.stderr)
         self.assertTrue(os.path.exists(other))
 
+    def test_standalone_bundle_survives_relocation_without_build_sources(self):
+        app = os.path.join(self.tmp.name, "Standalone.app")
+        runtime_path = os.path.dirname(shutil.which("mpv")) + ":/usr/bin:/bin:/usr/sbin:/sbin"
+        subprocess.run([os.path.join(ROOT, "tools", "make-app.sh"), "--standalone", app], check=True,
+                       capture_output=True, timeout=300,
+                       env=dict(os.environ, BUBBATV_DISTRIBUTION="homebrew", BUBBATV_RUNTIME_PATH=runtime_path,
+                                MPV_HOME=os.path.join(self.tmp.name, "profile")))
+        moved = os.path.join(self.tmp.name, "Moved player.app")
+        shutil.move(app, moved)
+        with open(os.path.join(moved, "Contents", "Info.plist"), "rb") as f:
+            info = plistlib.load(f)
+        self.assertTrue(info["BubbaTVBundledPlayer"])
+        self.assertEqual(info["BubbaTVDualplay"], "")
+        self.assertEqual(info["BubbaTVDistribution"], "homebrew")
+        self.assertEqual(info["BubbaTVPath"], runtime_path)
+        player = os.path.join(moved, "Contents", "Resources", "Player")
+        self.assertFalse(os.path.exists(os.path.join(player, "tools", "audio-pairs.swift")))
+        self.assertFalse(os.path.exists(os.path.join(player, "tools", "bubbatv-menu.swift")))
+        for binary in ("audio-pairs", "bubbatv.so"):
+            self.assertTrue(os.path.exists(os.path.join(player, "tools", ".build", binary)))
+        output = subprocess.check_output([os.path.join(moved, "Contents", "MacOS", "bubbaTV"),
+                                          "--dry-run", TONES], text=True)
+        self.assertEqual(shlex.split(output)[0], os.path.join(player, "dualplay"))
+        subprocess.run([os.path.join(player, "dualplay"), "-B"], check=True, timeout=60,
+                       env=dict(os.environ, PATH="/usr/bin:/bin"))
+        subprocess.run([os.path.join(player, "dualplay"), TONES, "--no-config", "--vo=null", "--ao=null",
+                        "--end=0.2", "--really-quiet"], check=True, timeout=30,
+                       env=dict(os.environ, PATH=runtime_path, MPV_HOME=os.path.join(self.tmp.name, "profile")))
+        subprocess.run(["codesign", "--verify", "--strict", moved], check=True, capture_output=True)
+
     def test_two_pairs_with_two_bluetooth_outputs(self):
         for bluetooth, pairs in ((0, ""), (1, ""), (2, "-2 "), (3, "")):
             self.outputs("  MacBook Pro Speakers (2 ch)",
                          *("  AirPods %d (2 ch, Bluetooth)" % i for i in range(bluetooth)))
             out = self.dry_run(TONES)
-            self.assertEqual((out.returncode, out.stdout), (0, "%s %s%s\n" % (self.fake, pairs, TONES)))
+            self.assertEqual((out.returncode, out.stdout),
+                             (0, "%s %s%s --quiet --msg-time\n" % (self.fake, pairs, TONES)))
 
     def test_dualplay_gets_the_baked_path(self):
         path = os.path.dirname(shutil.which("mpv")) + ":/usr/bin:/bin"
@@ -1912,7 +2245,7 @@ class App(unittest.TestCase):
         # Several files make a playlist; the dry run quotes them for the shell.
         d = self.tmp.name
         out = self.dry_run(*(os.path.join(d, n) for n in ("Episode 10.mkv", "Episode 2.mkv", "it's 1.mkv")))
-        self.assertEqual(out.stdout, "%s '%s/Episode 2.mkv' '%s/Episode 10.mkv' '%s/it'\\''s 1.mkv'\n"
+        self.assertEqual(out.stdout, "%s '%s/Episode 2.mkv' '%s/Episode 10.mkv' '%s/it'\\''s 1.mkv' --quiet --msg-time\n"
                          % (self.fake, d, d, d))
 
     def test_nothing_to_play(self):
@@ -1944,7 +2277,88 @@ class App(unittest.TestCase):
         for line in out.stdout.splitlines():
             self.assertRegex(line, r"^  .+ \(\d+ ch(, Bluetooth)?\)$")
         out = self.dry_run(TONES, Dualplay=os.path.join(repo, "dualplay"))
-        self.assertRegex(out.stdout, "^%s (-2 )?%s\n$" % (re.escape(os.path.join(repo, "dualplay")), re.escape(TONES)))
+        self.assertRegex(out.stdout, "^%s (-2 )?%s --quiet --msg-time\n$"
+                         % (re.escape(os.path.join(repo, "dualplay")), re.escape(TONES)))
+
+
+class AppHome(unittest.TestCase):
+    """Native home-window lifecycle, persistent recents, and playlist IPC."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("swiftc"):
+            raise unittest.SkipTest("needs swiftc")
+        cls.build = tempfile.TemporaryDirectory()
+        cls.app = os.path.join(cls.build.name, "HomeTests.app")
+        macos = os.path.join(cls.app, "Contents", "MacOS")
+        os.makedirs(macos)
+        cls.binary = os.path.join(macos, "bubbaTV")
+        subprocess.run(["swiftc", "-O", "-D", "BUBBATV_TESTING", "-o", cls.binary,
+                        *(os.path.join(ROOT, "tools", name) for name in
+                          ("bubbatv-app.swift", "bubbatv-home.swift", "bubbatv-library.swift")),
+                        os.path.join(ROOT, "tests", "app_home", "main.swift")], check=True, timeout=300)
+        cls.fake = os.path.join(cls.build.name, "dualplay")
+        with open(cls.fake, "w") as f:
+            f.write('#!/bin/sh\nif [ "$1" = -L ]; then echo "  Speakers (2 ch)"; exit 0; fi\n'
+                    'mkdir -p "$MPV_HOME"\nprintf "%s\\n" "$@" > "$MPV_HOME/launch-args"\nsleep 1\n')
+        os.chmod(cls.fake, 0o755)
+        with open(os.path.join(ROOT, "tools", "bubbatv-app.plist"), "rb") as f:
+            info = plistlib.load(f)
+        info.update(BubbaTVDualplay=cls.fake, BubbaTVPath=os.environ["PATH"])
+        with open(os.path.join(cls.app, "Contents", "Info.plist"), "wb") as f:
+            plistlib.dump(info, f)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.build.cleanup()
+
+    def check(self, mode):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run([self.binary, mode, tmp], capture_output=True, text=True, timeout=30,
+                                    env=dict(os.environ, MPV_HOME=os.path.join(tmp, "profile")))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("ok ", result.stdout)
+
+    def test_history_persists_and_only_shows_available_media(self):
+        self.check("history")
+
+    def test_homebrew_update_uses_package_manager_instead_of_git(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = os.path.join(tmp, "HomeTests.app")
+            shutil.copytree(self.app, app)
+            plist = os.path.join(app, "Contents", "Info.plist")
+            with open(plist, "rb") as f:
+                info = plistlib.load(f)
+            info["BubbaTVDistribution"] = "homebrew"
+            with open(plist, "wb") as f:
+                plistlib.dump(info, f)
+            result = subprocess.run([os.path.join(app, "Contents", "MacOS", "bubbaTV"), "homebrew-update", tmp],
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_continue_keeps_the_current_file_when_earlier_files_disappear(self):
+        self.check("resume")
+
+    def test_home_hides_for_playback_and_returns_when_queue_ends(self):
+        self.check("window")
+
+    def test_continue_launches_the_saved_position_and_surviving_episode(self):
+        self.check("window-resume")
+
+    def test_more_media_is_appended_to_the_same_player_queue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mpv = Mpv(tmp, "--pause", "--idle=yes")
+            try:
+                mpv.wait_for(lambda: mpv.get("time-pos") is not None)
+                result = subprocess.run([self.binary, "queue", tmp, mpv.path], capture_output=True, text=True, timeout=30,
+                                        env=dict(os.environ, MPV_HOME=os.path.join(tmp, "profile")))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual([os.path.basename(e["filename"]) for e in mpv.get("playlist")],
+                                 ["tones.mkv", "Episode 2.MP4", "Episode 10.mkv"])
+                self.assertEqual(mpv.get("playlist-pos"), 0)
+                self.assertTrue(mpv.get("pause"))
+            finally:
+                mpv.close()
 
 
 if __name__ == "__main__":
