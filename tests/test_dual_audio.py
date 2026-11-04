@@ -622,12 +622,21 @@ class Keys(Playing):
         # mpv builds the --af filter anew from its string when it reopens
         # the audio output (another output device, ao-reload), too.
         self.press("a", (1, 2))
+        # Let the toggle's seek and audio-reconfig finish before testing a
+        # live command; an uninitialized filter legitimately uses set_af.
+        self.mpv.command("set_property", "pause", False)
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") > 3.3)
+        self.mpv.command("set_property", "pause", True)
+        position = self.mpv.get("time-pos")
         self.message("set-gain", 2, -6)
         self.wait_sides([(0, 0), (-6, 0)])
         self.assertIn("volume@dual_audio2=0dB", self.af_graph())  # live
         self.mpv.command("ao-reload")
         self.af_has("volume@dual_audio2=-6dB")
-        self.expect((1, 2))
+        self.assertEqual(re.findall(r"\[aid(\d+)\]", self.mpv.get("lavfi-complex")), ["1", "2"])
+        self.assertTrue(self.state()["active"])
+        self.assertEqual([s["track"] for s in self.state()["sides"]], [1, 2])
+        self.assertAlmostEqual(self.mpv.get("time-pos"), position, delta=0.05)
 
     def test_own_filters_left_alone(self):
         # Ours goes first, on the joined channels; the user's come after,
