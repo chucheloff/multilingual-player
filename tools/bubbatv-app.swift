@@ -11,11 +11,11 @@
 // with -2, a pair each. With more, the two headphones played with before
 // (remembered in mpv's config dir) are the pairs; if that doesn't settle it,
 // it asks. With fewer it plays on one shared pair, a language per ear.
-// Opened on its own it offers to continue what played last (dual_audio.lua
-// keeps that in dual_audio-last.json), to pick a movie, or to update this
-// checkout (git pull, then rebuild what changed).
+// Opened on its own it shows a home window with recent media, a drop area,
+// and Continue. The home window is hidden for the whole playback queue and
+// returns when mpv closes. File > Open Media and Finder/Dock drops work too.
 // mpv's output goes to ~/Library/Logs/bubbaTV.log (the two runs before to
-// bubbaTV.1.log, bubbaTV.2.log). The app quits with mpv.
+// bubbaTV.1.log, bubbaTV.2.log). Quitting bubbaTV stops mpv too.
 import Cocoa
 import UniformTypeIdentifiers
 
@@ -33,8 +33,7 @@ struct Problem: Error {
     let detail: String
 
     static let nothing = Problem(title: "Nothing to play", detail:
-        "Drop a movie or a folder of episodes on bubbaTV in the Dock or in Finder, "
-        + "or right-click one and choose Open With > bubbaTV.")
+        "Choose Open Media or drop a media file or folder into the bubbaTV window.")
 }
 
 /// dualplay with these arguments, run with the baked-in PATH.
@@ -108,32 +107,6 @@ func pairs() -> Pairs {
     return familiar.count == 2 ? .two(familiar) : .ask(bluetooth)
 }
 
-/// What played last, as dual_audio.lua saved it; nil when there is nothing
-/// to continue (it played to its end, or the files are gone).
-struct Last {
-    let files: [String]
-    let title: String
-    let time: Double?
-
-    static func load() -> Last? {
-        guard let o = json("dual_audio-last.json") as? [String: Any],
-              let files = o["playlist"] as? [String], let index = o["index"] as? Int,
-              files.indices.contains(index), o["finished"] as? Bool != true,
-              FileManager.default.fileExists(atPath: files[index]) else { return nil }
-        let title = o["title"] as? String ?? (files[index] as NSString).lastPathComponent
-        return Last(files: files.filter { FileManager.default.fileExists(atPath: $0) }, title: title,
-                    time: o["time"] as? Double)
-    }
-
-    var label: String {
-        guard let time, time >= 1 else { return "Continue \u{201C}\(title)\u{201D}" }
-        let t = Int(time)
-        let at = t >= 3600 ? String(format: "%d:%02d:%02d", t / 3600, t / 60 % 60, t % 60)
-                           : String(format: "%d:%02d", t / 60, t % 60)
-        return "Continue \u{201C}\(title)\u{201D} at \(at)"
-    }
-}
-
 /// The dualplay command for these files, or what stands in its way. `on`:
 /// the pairs, as pairs() or the person chose them. Files are put in episode
 /// order unless `ordered` (a playlist to continue keeps its own).
@@ -189,7 +162,8 @@ func update() -> (Problem, relaunch: Bool) {
     var detail = "Branch \(branch):\n" + news
     let (built, buildWhy) = run(dualplayProcess(["-B"]))
     if built != 0 { detail += "\n\nBuilding the helpers failed:\n" + buildWhy }
-    let app = ["tools/bubbatv-app.swift", "tools/bubbatv-app.plist", "tools/make-app.sh"]
+    let app = ["tools/bubbatv-app.swift", "tools/bubbatv-home.swift", "tools/bubbatv-library.swift",
+               "tools/make-icon.swift", "tools/bubbatv-app.plist", "tools/make-app.sh"]
     guard changed.contains(where: { app.contains(String($0)) }) else {
         return (Problem(title: "bubbaTV is updated", detail: detail), false)
     }
@@ -218,72 +192,183 @@ func quoted(_ s: String) -> String {
 }
 
 @MainActor
-final class App: NSObject, NSApplicationDelegate {
+final class App: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+    private let playbackLog: String
     private var opened = false
+    private var opening = false
     private var running: Process?
     private var quitting = false
+    private var socketDirectory: URL?
+    private var pending: [String] = []
+    private let ipcQueue = DispatchQueue(label: "bubbaTV.playlist")
+    private let history = RecentMedia(file: URL(fileURLWithPath: mpvConfig + "/bubbatv-recent.json"))
+    private let lastFile = URL(fileURLWithPath: mpvConfig + "/dual_audio-last.json")
+    private var recentMenu = NSMenu(title: "Open Recent")
+    lazy var home: HomeWindow = makeHome()
+
+    init(logFile: String = log) {
+        playbackLog = logFile
+        super.init()
+    }
+
+    private func makeHome() -> HomeWindow {
+        let home = HomeWindow()
+        home.onOpen = { [weak self] in self?.pickFiles() }
+        home.onPlay = { [weak self] in self?.play([$0]) }
+        home.onDrop = { [weak self] in self?.play($0.map(\.path)) }
+        home.onResume = { [weak self] in
+            guard let self, let last = LastPlayback.load(from: self.lastFile), last.canResume else { return }
+            self.play(last.files, resume: last)
+        }
+        home.onClear = { [weak self] in
+            guard let self else { return }
+            do { try self.history.clear(); self.refreshHome() }
+            catch { self.show(Problem(title: "Could not clear recent media", detail: error.localizedDescription)) }
+        }
+        home.onRemove = { [weak self] path in
+            guard let self else { return }
+            do { try self.history.remove(path); self.refreshHome() }
+            catch { self.show(Problem(title: "Could not remove recent media", detail: error.localizedDescription)) }
+        }
+        return home
+    }
 
     func application(_ app: NSApplication, open urls: [URL]) {
         opened = true
         play(urls.map(\.path))
     }
 
-    // Files the app was started with arrive before this; allow a moment anyway.
     func applicationDidFinishLaunching(_ note: Notification) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            if !self.opened { self.choose() }
+        installMenus()
+        // One existing watch-later session can seed a newly created history.
+        // Clearing history creates an empty file, so it stays cleared.
+        if !FileManager.default.fileExists(atPath: history.file.path),
+           let last = LastPlayback.load(from: lastFile), mediaExists(last.current) {
+            remember([last.current])
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            if !self.opened { self.showHome() }
         }
     }
 
-    // Quitting bubbaTV stops the movie too. dualplay runs in a process group
-    // of its own (with mpv), and removes the combined device as it exits.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        if running == nil { showHome() }
+        return false
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    // dualplay and mpv share their own process group; its exit trap removes
+    // the combined device. Keep the library hidden while the queue plays.
     func applicationShouldTerminate(_ app: NSApplication) -> NSApplication.TerminateReply {
-        guard let running else { return .terminateNow }
         quitting = true
+        guard let running else { return .terminateNow }
         kill(-running.processIdentifier, SIGTERM)
         return .terminateLater
     }
 
-    /// Started without a movie: continue the last one, pick one, or update.
-    private func choose() {
-        let last = Last.load()
-        let alert = NSAlert()
-        alert.messageText = Problem.nothing.title
-        alert.informativeText = Problem.nothing.detail
-        var actions: [() -> Void] = []
-        if let last {
-            alert.addButton(withTitle: last.label)
-            actions.append { self.play(last.files, ordered: true) }
+    private func installMenus() {
+        let bar = NSMenu()
+        let application = NSMenu(title: "bubbaTV")
+        application.addItem(withTitle: "About bubbaTV", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        let update = application.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+        update.target = self
+        application.addItem(.separator())
+        application.addItem(withTitle: "Hide bubbaTV", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        application.addItem(.separator())
+        application.addItem(withTitle: "Quit bubbaTV", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let appItem = bar.addItem(withTitle: "bubbaTV", action: nil, keyEquivalent: "")
+        appItem.submenu = application
+        let file = NSMenu(title: "File")
+        let open = file.addItem(withTitle: "Open Media…", action: #selector(pickFiles), keyEquivalent: "o")
+        open.target = self
+        let recent = file.addItem(withTitle: "Open Recent", action: nil, keyEquivalent: "")
+        recent.submenu = recentMenu
+        file.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        bar.addItem(withTitle: "File", action: nil, keyEquivalent: "").submenu = file
+        let edit = NSMenu(title: "Edit")
+        for (title, selector, key) in [("Cut", "cut:", "x"), ("Copy", "copy:", "c"),
+                                        ("Paste", "paste:", "v"), ("Select All", "selectAll:", "a")] {
+            edit.addItem(withTitle: title, action: NSSelectorFromString(selector), keyEquivalent: key)
         }
-        alert.addButton(withTitle: "Choose Movie…")
-        actions.append { self.pickFiles() }
-        alert.addButton(withTitle: "Check for Updates")
-        actions.append { self.checkForUpdates() }
-        alert.addButton(withTitle: "Quit")
-        actions.append { NSApp.terminate(nil) }
+        bar.addItem(withTitle: "Edit", action: nil, keyEquivalent: "").submenu = edit
+        let window = NSMenu(title: "Window")
+        window.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        window.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        bar.addItem(withTitle: "Window", action: nil, keyEquivalent: "").submenu = window
+        NSApp.windowsMenu = window
+        NSApp.mainMenu = bar
+    }
+
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if item.action == #selector(checkForUpdates) { return !opening && running == nil }
+        if item.action == #selector(pickFiles) { return !opening }
+        return true
+    }
+
+    private func refreshHome() {
+        let items = history.available
+        home.refresh(items: items, last: LastPlayback.load(from: lastFile))
+        recentMenu.removeAllItems()
+        for item in items {
+            let row = recentMenu.addItem(withTitle: URL(fileURLWithPath: item.path).lastPathComponent,
+                                        action: #selector(openRecent(_:)), keyEquivalent: "")
+            row.target = self
+            row.representedObject = item.path
+            row.toolTip = item.path
+        }
+        if items.isEmpty {
+            recentMenu.addItem(withTitle: "No recent media", action: nil, keyEquivalent: "").isEnabled = false
+        }
+    }
+
+    private func showHome() {
+        guard running == nil && !quitting else { return }
+        NSApp.setActivationPolicy(.regular)
+        refreshHome()
+        home.setBusy(opening)
+        home.showWindow(nil)
+        home.window?.makeKeyAndOrderFront(nil)
         front()
-        let i = alert.runModal().rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
-        actions.indices.contains(i) ? actions[i]() : NSApp.terminate(nil)
     }
 
-    private func checkForUpdates() {
-        let (result, relaunch) = update()
-        show(result)
-        guard relaunch else { return choose() }
-        // The bundle is the new one now: open it once this one has quit.
-        let again = Process()
-        again.executableURL = URL(fileURLWithPath: "/bin/sh")
-        again.arguments = ["-c", "sleep 1; open \"$0\"", Bundle.main.bundlePath]
-        try? again.run()
-        NSApp.terminate(nil)
+    @objc private func openRecent(_ sender: NSMenuItem) {
+        if let path = sender.representedObject as? String { play([path]) }
     }
 
-    private func pickFiles() {
+    @objc private func checkForUpdates() {
+        guard !opening && running == nil else { return }
+        opening = true
+        home.setBusy(true)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let (result, relaunch) = update()
+            DispatchQueue.main.async {
+                self.opening = false
+                self.home.setBusy(false)
+                self.show(result)
+                guard relaunch else {
+                    if self.pending.isEmpty { self.showHome() }
+                    else { let files = self.pending; self.pending = []; self.play(files) }
+                    return
+                }
+                let again = Process()
+                again.executableURL = URL(fileURLWithPath: "/bin/sh")
+                again.arguments = ["-c", "sleep 1; open -a \"$0\" \"$@\"", Bundle.main.bundlePath] + self.pending
+                try? again.run()
+                NSApp.terminate(nil)
+            }
+        }
+    }
+
+    @objc private func pickFiles() {
+        guard !opening else { return }
         let panel = NSOpenPanel()
+        panel.title = "Open Media"
+        panel.prompt = "Play"
         panel.allowsMultipleSelection = true
-        panel.canChooseDirectories = true  // a folder of episodes
-        panel.allowedContentTypes = [.movie] + ["mkv", "webm"].compactMap { UTType(filenameExtension: $0) }
-        guard panel.runModal() == .OK else { return NSApp.terminate(nil) }
+        panel.canChooseDirectories = true
+        panel.allowedContentTypes = [.movie, .audio] + ["mkv", "webm"].compactMap { UTType(filenameExtension: $0) }
+        guard panel.runModal() == .OK else { return }
         play(panel.urls.map(\.path))
     }
 
@@ -321,57 +406,126 @@ final class App: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func play(_ files: [String], ordered: Bool = false) {
-        if running != nil {
-            return show(Problem(title: "Already playing", detail: "Quit mpv first, then open the next movie."))
+    private func play(_ paths: [String], resume: LastPlayback? = nil) {
+        let files = normalizedMedia(paths)
+        guard !files.isEmpty else {
+            showHome()
+            return show(Problem(title: "No available media", detail: "Choose a media file or a folder that is still on disk."))
         }
-        var on = pairs()
+        if running != nil { return enqueue(files) }
+        if opening { pending += files; return }
+        opening = true
+        showHome()
+        // First-run compilation and CoreAudio discovery can take a while.
+        // Keep the home window responsive and visibly preparing playback.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let on = pairs()
+            DispatchQueue.main.async { self.launch(files, on: on, resume: resume) }
+        }
+    }
+
+    private func launch(_ files: [String], on initial: Pairs, resume: LastPlayback?) {
+        guard !quitting else { return }
+        var on = initial
         if case .ask(let outputs) = on {
-            guard let chosen = askPairs(outputs) else { return NSApp.terminate(nil) }
+            guard let chosen = askPairs(outputs) else {
+                opening = false; pending = []; showHome(); return
+            }
             on = chosen
         }
         let p: Process
         do {
-            p = dualplayProcess(Array(try command(files, on: on, ordered: ordered).dropFirst()))
+            var args = Array(try command(files, on: on, ordered: resume != nil).dropFirst())
+            // Audio-only media still needs a player window and its controls
+            // while the home window is hidden.
+            args.append("--force-window=yes")
+            if let resume {
+                args.append("--playlist-start=\(resume.resumeIndex)")
+                if let time = resume.time, time.isFinite && time >= 0 { args.append("--start=\(time)") }
+            }
+            let directory = URL(fileURLWithPath: "/tmp/bubbatv-" + UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                    attributes: [.posixPermissions: 0o700])
+            socketDirectory = directory
+            args.append("--input-ipc-server=" + directory.appendingPathComponent("player.sock").path)
+            p = dualplayProcess(args)
         } catch {
-            show(error)
-            return NSApp.terminate(nil)
+            opening = false; pending = []; cleanSocket(); showHome()
+            if let problem = error as? Problem { show(problem) }
+            else { show(Problem(title: "Could not prepare playback", detail: error.localizedDescription)) }
+            return
         }
-        // A fresh log per movie; the two before stay as bubbaTV.1.log, bubbaTV.2.log.
-        let older = { (n: Int) in (log as NSString).deletingPathExtension + ".\(n).log" }
+        let older = { (n: Int) in (self.playbackLog as NSString).deletingPathExtension + ".\(n).log" }
+        try? FileManager.default.createDirectory(atPath: (playbackLog as NSString).deletingLastPathComponent,
+                                                withIntermediateDirectories: true)
         try? FileManager.default.removeItem(atPath: older(2))
         try? FileManager.default.moveItem(atPath: older(1), toPath: older(2))
-        try? FileManager.default.moveItem(atPath: log, toPath: older(1))
-        FileManager.default.createFile(atPath: log, contents: nil)
-        let out = FileHandle(forWritingAtPath: log) ?? FileHandle.nullDevice
+        try? FileManager.default.moveItem(atPath: playbackLog, toPath: older(1))
+        FileManager.default.createFile(atPath: playbackLog, contents: nil)
+        let out = FileHandle(forWritingAtPath: playbackLog) ?? FileHandle.nullDevice
         p.standardOutput = out
         p.standardError = out
         p.terminationHandler = { p in
             let (reason, status) = (p.terminationReason, p.terminationStatus)
             DispatchQueue.main.async { self.finished(reason, status) }
         }
-        do {
-            try p.run()
-        } catch {
-            show(Problem(title: "Could not start dualplay", detail: error.localizedDescription))
-            return NSApp.terminate(nil)
+        do { try p.run() }
+        catch {
+            opening = false; pending = []; cleanSocket(); showHome()
+            return show(Problem(title: "Could not start playback", detail: error.localizedDescription))
         }
         running = p
-        // mpv has a Dock icon of its own while it plays.
+        opening = false
+        remember(files)
+        home.window?.orderOut(nil)
+        // mpv's video window and Dock icon take over until the entire queue ends.
         NSApp.setActivationPolicy(.accessory)
+        if !pending.isEmpty { let queued = pending; pending = []; enqueue(queued) }
+    }
+
+    private func enqueue(_ paths: [String]) {
+        guard let session = running, let directory = socketDirectory else { return }
+        let socket = directory.appendingPathComponent("player.sock").path
+        ipcQueue.async {
+            do {
+                let files = try queuedMedia(paths)
+                try appendToPlayer(files, socketPath: socket)
+                DispatchQueue.main.async {
+                    guard self.running === session else { return }
+                    self.remember(paths)
+                }
+            } catch {
+                let detail = error.localizedDescription
+                DispatchQueue.main.async {
+                    guard self.running === session else { return }
+                    self.show(Problem(title: "Could not add media to the queue", detail: detail))
+                }
+            }
+        }
+    }
+
+    private func remember(_ files: [String]) {
+        do { try history.remember(files) }
+        catch { NSLog("bubbaTV: could not save recent media: %@", error.localizedDescription) }
+    }
+
+    private func cleanSocket() {
+        if let directory = socketDirectory { try? FileManager.default.removeItem(at: directory) }
+        socketDirectory = nil
     }
 
     private func finished(_ reason: Process.TerminationReason, _ status: Int32) {
         running = nil
+        cleanSocket()
         if quitting { return NSApp.reply(toApplicationShouldTerminate: true) }
-        // 4: mpv was stopped by a signal (Ctrl+C in its window), not an error.
+        showHome()
+        // 4: mpv was stopped by a signal, not a playback error.
         if reason == .exit && status != 0 && status != 4 {
-            let text = (try? String(contentsOfFile: log, encoding: .utf8)) ?? ""
+            let text = (try? String(contentsOfFile: playbackLog, encoding: .utf8)) ?? ""
             let tail = text.split(separator: "\n").suffix(12).joined(separator: "\n")
             show(Problem(title: "Playback stopped with an error",
                          detail: tail + "\n\nThe whole output is in ~/Library/Logs/bubbaTV.log."))
         }
-        NSApp.terminate(nil)
     }
 
     private func show(_ problem: Problem) {
@@ -383,24 +537,30 @@ final class App: NSObject, NSApplicationDelegate {
     }
 }
 
-let args = Array(CommandLine.arguments.dropFirst())
-if args.first == "--dry-run" {
-    do {
-        var on = pairs()
-        if case .ask(let outputs) = on {
-            // No one to ask: one pair, as without the choice.
-            FileHandle.standardError.write(Data("bubbaTV: would ask which two of: \(outputs.joined(separator: ", "))\n".utf8))
-            on = .one
+#if !BUBBATV_TESTING
+@main
+struct BubbaTV {
+    @MainActor static func main() {
+        let args = Array(CommandLine.arguments.dropFirst())
+        if args.first == "--dry-run" {
+            do {
+                var on = pairs()
+                if case .ask(let outputs) = on {
+                    FileHandle.standardError.write(Data("bubbaTV: would ask which two of: \(outputs.joined(separator: ", "))\n".utf8))
+                    on = .one
+                }
+                print(try command(Array(args.dropFirst()), on: on).map(quoted).joined(separator: " "))
+            } catch {
+                FileHandle.standardError.write(Data("bubbaTV: \(error.title). \(error.detail)\n".utf8))
+                exit(1)
+            }
+            return
         }
-        print(try command(Array(args.dropFirst()), on: on).map(quoted).joined(separator: " "))
-        exit(0)
-    } catch {
-        FileHandle.standardError.write(Data("bubbaTV: \(error.title). \(error.detail)\n".utf8))
-        exit(1)
+        let delegate = App()
+        NSApplication.shared.setActivationPolicy(.regular)
+        NSApplication.shared.delegate = delegate
+        NSApplication.shared.run()
+        withExtendedLifetime(delegate) {}
     }
 }
-MainActor.assumeIsolated {
-    let delegate = App()  // NSApp holds its delegate weakly
-    NSApplication.shared.delegate = delegate
-    NSApplication.shared.run()
-}
+#endif

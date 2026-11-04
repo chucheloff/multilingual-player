@@ -622,12 +622,21 @@ class Keys(Playing):
         # mpv builds the --af filter anew from its string when it reopens
         # the audio output (another output device, ao-reload), too.
         self.press("a", (1, 2))
+        # Let the toggle's seek and audio-reconfig finish before testing a
+        # live command; an uninitialized filter legitimately uses set_af.
+        self.mpv.command("set_property", "pause", False)
+        self.mpv.wait_for(lambda: self.mpv.get("time-pos") > 3.3)
+        self.mpv.command("set_property", "pause", True)
+        position = self.mpv.get("time-pos")
         self.message("set-gain", 2, -6)
         self.wait_sides([(0, 0), (-6, 0)])
         self.assertIn("volume@dual_audio2=0dB", self.af_graph())  # live
         self.mpv.command("ao-reload")
         self.af_has("volume@dual_audio2=-6dB")
-        self.expect((1, 2))
+        self.assertEqual(re.findall(r"\[aid(\d+)\]", self.mpv.get("lavfi-complex")), ["1", "2"])
+        self.assertTrue(self.state()["active"])
+        self.assertEqual([s["track"] for s in self.state()["sides"]], [1, 2])
+        self.assertAlmostEqual(self.mpv.get("time-pos"), position, delta=0.05)
 
     def test_own_filters_left_alone(self):
         # Ours goes first, on the joined channels; the user's come after,
@@ -2147,6 +2156,8 @@ class App(unittest.TestCase):
         self.assertTrue(os.access(os.path.join(self.app, "Contents", "MacOS", info["CFBundleExecutable"]), os.X_OK))
         self.assertEqual(info["BubbaTVDualplay"], os.path.join(ROOT, "dualplay"))
         self.assertEqual(info["BubbaTVPath"], self.path + ":/opt/homebrew/bin:/usr/local/bin")
+        self.assertEqual(info["CFBundleIconFile"], "bubbaTV.icns")
+        self.assertGreater(os.path.getsize(os.path.join(self.app, "Contents", "Resources", "bubbaTV.icns")), 1000)
         # Offered for movies and folders of episodes, never their default app.
         types = info["CFBundleDocumentTypes"]
         self.assertEqual({t["LSHandlerRank"] for t in types}, {"Alternate"})
@@ -2234,6 +2245,72 @@ class App(unittest.TestCase):
         out = self.dry_run(TONES, Dualplay=os.path.join(repo, "dualplay"))
         self.assertRegex(out.stdout, "^%s (-2 )?%s --quiet --msg-time\n$"
                          % (re.escape(os.path.join(repo, "dualplay")), re.escape(TONES)))
+
+
+class AppHome(unittest.TestCase):
+    """Native home-window lifecycle, persistent recents, and playlist IPC."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("swiftc"):
+            raise unittest.SkipTest("needs swiftc")
+        cls.build = tempfile.TemporaryDirectory()
+        cls.app = os.path.join(cls.build.name, "HomeTests.app")
+        macos = os.path.join(cls.app, "Contents", "MacOS")
+        os.makedirs(macos)
+        cls.binary = os.path.join(macos, "bubbaTV")
+        subprocess.run(["swiftc", "-O", "-D", "BUBBATV_TESTING", "-o", cls.binary,
+                        *(os.path.join(ROOT, "tools", name) for name in
+                          ("bubbatv-app.swift", "bubbatv-home.swift", "bubbatv-library.swift")),
+                        os.path.join(ROOT, "tests", "app_home", "main.swift")], check=True, timeout=300)
+        cls.fake = os.path.join(cls.build.name, "dualplay")
+        with open(cls.fake, "w") as f:
+            f.write('#!/bin/sh\nif [ "$1" = -L ]; then echo "  Speakers (2 ch)"; exit 0; fi\n'
+                    'mkdir -p "$MPV_HOME"\nprintf "%s\\n" "$@" > "$MPV_HOME/launch-args"\nsleep 1\n')
+        os.chmod(cls.fake, 0o755)
+        with open(os.path.join(ROOT, "tools", "bubbatv-app.plist"), "rb") as f:
+            info = plistlib.load(f)
+        info.update(BubbaTVDualplay=cls.fake, BubbaTVPath=os.environ["PATH"])
+        with open(os.path.join(cls.app, "Contents", "Info.plist"), "wb") as f:
+            plistlib.dump(info, f)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.build.cleanup()
+
+    def check(self, mode):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run([self.binary, mode, tmp], capture_output=True, text=True, timeout=30,
+                                    env=dict(os.environ, MPV_HOME=os.path.join(tmp, "profile")))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("ok ", result.stdout)
+
+    def test_history_persists_and_only_shows_available_media(self):
+        self.check("history")
+
+    def test_continue_keeps_the_current_file_when_earlier_files_disappear(self):
+        self.check("resume")
+
+    def test_home_hides_for_playback_and_returns_when_queue_ends(self):
+        self.check("window")
+
+    def test_continue_launches_the_saved_position_and_surviving_episode(self):
+        self.check("window-resume")
+
+    def test_more_media_is_appended_to_the_same_player_queue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mpv = Mpv(tmp, "--pause", "--idle=yes")
+            try:
+                mpv.wait_for(lambda: mpv.get("time-pos") is not None)
+                result = subprocess.run([self.binary, "queue", tmp, mpv.path], capture_output=True, text=True, timeout=30,
+                                        env=dict(os.environ, MPV_HOME=os.path.join(tmp, "profile")))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual([os.path.basename(e["filename"]) for e in mpv.get("playlist")],
+                                 ["tones.mkv", "Episode 2.MP4", "Episode 10.mkv"])
+                self.assertEqual(mpv.get("playlist-pos"), 0)
+                self.assertTrue(mpv.get("pause"))
+            finally:
+                mpv.close()
 
 
 if __name__ == "__main__":

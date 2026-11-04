@@ -60,9 +60,12 @@ its title and language are matched in the next episode even if track IDs change.
 tools/make-app.sh ~/Applications/bubbaTV.app
 ```
 
-Then drop a movie or a [folder of episodes](#a-folder-of-episodes) on
-**bubbaTV** (keep it in the Dock, or in Finder), or right-click one → Open
-With → bubbaTV. It plays with `dualplay`: on two pairs (`-2`) when exactly
+Open **bubbaTV** from the Dock or Applications. Its home window has a
+**Drop media here to play it** area and **Open Media…** (`⌘O`) for movies,
+audio files, or a [folder of episodes](#a-folder-of-episodes). Dropping onto
+the Dock icon and Finder's Open With → bubbaTV still work.
+
+It plays with `dualplay`: on two pairs (`-2`) when exactly
 two Bluetooth headphones are connected, otherwise on one shared pair, an ear
 each. With more than two (a Bluetooth speaker too), the two headphones that
 played before are the pairs; if that doesn't settle it, bubbaTV asks which
@@ -70,14 +73,24 @@ two, or offers one shared pair. The
 languages are `left_lang` / `right_lang` from `dual_audio.conf` (see
 [Install as a plugin](#install-as-a-plugin)); without them, the track that
 would normally play comes first. Several files or folders play as a playlist, in name
-order. bubbaTV quits when mpv does, and quitting bubbaTV stops mpv.
+order. The home window disappears when playback starts; only the video
+player is visible. It returns after the whole queue finishes or the player
+is closed, not between episodes. Opening more media through Finder or the
+Dock during playback adds it to the existing queue. Quitting bubbaTV stops
+mpv too.
 
-Opened on its own (click it in the Dock), bubbaTV offers:
+The home window also offers:
 
-- **Continue “…” at 12:34** — what played last, where you quit: the same
-  movie, or the same folder of episodes at the episode you were on.
-- **Choose Movie…**
-- **Check for Updates** — `git pull` in this folder, then it rebuilds what
+- **Continue / Resume** — the last unfinished movie or episode at its saved
+  position, even if an earlier episode has since been removed.
+- **Recent media** — the last 20 opened files or folders that still exist on
+  disk. Click Play, double-click a row, or select it and press Return.
+  Right-click for **Show in Finder** or **Remove from Recents**. **Clear**
+  clears the list; neither action deletes the media. Missing items are
+  hidden and reappear if their drive is reconnected. The history is kept in
+  `~/.config/mpv/bubbatv-recent.json` (or under `MPV_HOME`).
+- **File → Open Recent** and **bubbaTV → Check for Updates…**. Updates run
+  `git pull` in this folder, then rebuild what
   changed (the helpers, the menu, and the app itself, which then opens
   again) and lists what's new. A folder with changes of its own is left
   alone.
