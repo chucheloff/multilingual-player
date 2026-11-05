@@ -1,26 +1,16 @@
-# multilingual-player
+# bubbaTV
 
 Watch a movie with a friend in two languages at once, on one Mac:
 
 - **Two pairs of AirPods:** each person gets their language in stereo on their own pair.
 - **One pair, shared:** one bud each, a language per ear.
 
-It's a plugin for [mpv](https://mpv.io) (`scripts/dual_audio.lua`) plus a
-small launcher (`dualplay`), with a **bubbaTV** menu in mpv's menu bar for
-each pair's headphones, track, loudness and delay, and subtitles in both
-languages. Tracks, language preferences, loudness and delay are remembered
-per headphones, and a sync
-pattern helps set the delays. `←` / `→` go back and forth exactly 5 seconds,
-to hear a line again, as do left/right mouse double-clicks, and a folder of
-episodes plays one after another. The
-**bubbaTV** app starts a movie without the terminal.
+[Install with Homebrew](#install-with-homebrew) · [Release 0.1.0](https://github.com/chucheloff/multilingual-player/releases/tag/0.1.0)
 
 ## Install with Homebrew
 
 Requires Homebrew 7 or newer, macOS 14 or later, and Swift 6
 (Xcode 16 Command Line Tools or newer).
-The repository is private, so Git must already have access to it. Homebrew
-uses the same Git credentials when fetching the tap and source.
 
 ```sh
 brew tap chucheloff/multilingual-player https://github.com/chucheloff/multilingual-player.git
@@ -46,7 +36,24 @@ To update the Homebrew copy, run `brew update` followed by
 Homebrew…** menu shows these commands. Settings and recent media are kept
 outside the app and survive upgrades.
 
-## Quick start
+## Release 0.1.0
+
+The [0.1.0 release](https://github.com/chucheloff/multilingual-player/releases/tag/0.1.0)
+includes an Apple Silicon app ZIP, the source archive, build information,
+and SHA-256 checksums. The app ZIP is ad-hoc signed and macOS Gatekeeper may
+block it. Homebrew is the recommended installation method.
+
+## Run from a source checkout
+
+It's a plugin for [mpv](https://mpv.io) (`scripts/dual_audio.lua`) plus a
+small launcher (`dualplay`), with a **bubbaTV** menu in mpv's menu bar for
+each pair's headphones, track, loudness and delay, and subtitles in both
+languages. Tracks, language preferences, loudness and delay are remembered
+per headphones, and a sync
+pattern helps set the delays. `←` / `→` go back and forth exactly 5 seconds,
+to hear a line again, as do left/right mouse double-clicks, and a folder of
+episodes plays one after another. The
+**bubbaTV** app starts a movie without the terminal.
 
 ```sh
 brew install mpv

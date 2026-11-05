@@ -5,7 +5,7 @@ class Bubbatv < Formula
   url "https://github.com/chucheloff/multilingual-player.git",
       revision: "265a9c42367bbe4e0403c71f15ece957e2b769d8"
   version "0.1.0"
-  # This private project does not declare an SPDX license.
+  # This project does not declare an SPDX license.
   license :cannot_represent
 
   depends_on macos: :sonoma
@@ -44,8 +44,6 @@ class Bubbatv < Formula
 
       To add a shortcut alongside a development app in Applications:
         ln -s #{opt_prefix}/bubbaTV.app ~/Applications/bubbaTV-homebrew.app
-
-      This private tap and its source require GitHub repository access.
     EOS
   end
 
